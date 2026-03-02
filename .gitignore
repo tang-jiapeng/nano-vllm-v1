@@ -194,3 +194,5 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 Qwen3-0.6B/
+
+docs/

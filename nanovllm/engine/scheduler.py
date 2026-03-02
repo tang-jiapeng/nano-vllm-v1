@@ -112,7 +112,7 @@ class Scheduler:
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
-        """抢占序列：释放其 KV-cache 块，状态置为 WAITING 并插入 waiting 队列头部。"""
+        """抢占序列：释放其 KV-cache 块，状态置为 WAITING 并插入 waiting 队列头部。
         - seq: 要抢占的序列
 
         抢占策略：
