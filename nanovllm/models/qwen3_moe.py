@@ -141,11 +141,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.hidden_act = config.hidden_act
-
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
 
         self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
         self.experts = nn.ModuleList(
@@ -158,6 +156,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 for _ in range(self.num_experts)
             ]
         )
+
+        # 共享专家 (Shared Expert)
+        self.shared_expert = Qwen3MoeMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.shared_expert_intermediate_size,
+            hidden_act=config.hidden_act,
+        )
+        self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
     def forward(self, hidden_states: torch.Tensor):
         seq_len, hidden_dim = hidden_states.shape
@@ -174,8 +180,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_weights, self.top_k, dim=-1
         )
 
-        # 对选中的 Top-K 权重重新归一化，使其和为 1
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # 根据配置决定是否对 Top-K 权重重新归一化
+        if self.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         # 初始化最终输出的张量，全为 0
@@ -212,6 +219,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 0, top_x, current_hidden_states.to(hidden_states.dtype)
             )
 
+        # 共享专家: 所有 Token 都经过 shared_expert，输出通过门控加权
+        shared_expert_output = self.shared_expert(hidden_states)
+        shared_expert_output = (
+            F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+        )
+        final_hidden_states = final_hidden_states + shared_expert_output
+
         return final_hidden_states
 
 
@@ -244,7 +258,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernrom = RMSNorm(
+        self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -265,7 +279,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.self_attn(positions, hidden_states)
 
         # Post 注意力归一化，更新残差
-        hidden_states, residual = self.post_attention_layernrom(hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # 路由并经过 MLP / MoE
         hidden_states = self.mlp(hidden_states)
