@@ -1,6 +1,7 @@
 from collections import deque
-import xxhash
+
 import numpy as np
+import xxhash
 
 from nanovllm.engine.sequence import Sequence
 
@@ -30,9 +31,12 @@ class Block:
 class BlockManager:
     """管理所有 KV-cache 块的分配/释放，维护空闲队列、引用计数和 prefix caching 哈希表。"""
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(
+        self, num_blocks: int, block_size: int, enable_prefix_caching: bool = True
+    ):
         """初始化块管理器，创建所有 block 实例并初始化空闲队列。"""
         self.block_size = block_size
+        self.enable_prefix_caching = enable_prefix_caching
 
         # 创建所有块
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
@@ -84,17 +88,17 @@ class BlockManager:
         assert not seq.block_table
 
         h = -1
-        cache_miss = False
+        cache_miss = not self.enable_prefix_caching  # 未启用时视为全部 miss
 
         # 遍历序列的每个block
         for i in range(seq.num_blocks):
             # 获取该block的token
             token_ids = seq.block(i)
 
-            # 计算哈希（仅对满的block计算）
+            # 计算哈希（仅对满的block计算，且启用 prefix caching 时才有意义）
             h = (
                 self.compute_hash(token_ids, h)
-                if len(token_ids) == self.block_size
+                if self.enable_prefix_caching and len(token_ids) == self.block_size
                 else -1
             )
 

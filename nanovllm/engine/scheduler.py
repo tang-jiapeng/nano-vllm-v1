@@ -1,8 +1,8 @@
 from collections import deque
 
 from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.sequence import Sequence, SequenceStatus
 
 
 class Scheduler:
@@ -25,7 +25,9 @@ class Scheduler:
         # 创建KV-cache块管理器
         # 负责分配、释放和管理KV-cache块，支持prefix caching
         self.block_manager = BlockManager(
-            config.num_kvcache_blocks, config.kvcache_block_size
+            config.num_kvcache_blocks,
+            config.kvcache_block_size,
+            enable_prefix_caching=config.enable_prefix_caching,
         )
 
         # 等待队列：包含所有已提交但未开始处理的序列
