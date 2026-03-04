@@ -27,7 +27,6 @@ class Scheduler:
         self.block_manager = BlockManager(
             config.num_kvcache_blocks,
             config.kvcache_block_size,
-            enable_prefix_caching=config.enable_prefix_caching,
         )
 
         # 等待队列：包含所有已提交但未开始处理的序列
