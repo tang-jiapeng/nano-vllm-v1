@@ -1,4 +1,23 @@
-from collections import deque
+"""
+KV-cache 块管理器，支持 prefix caching、LRU eviction 和 chunked prefill。
+
+块生命周期：
+    free_block_ids → used_block_ids → cached_blocks (LRU) → 被驱逐 → free_block_ids
+
+三个块池：
+    free_block_ids:  真正空闲的块（无有效数据）
+    used_block_ids:  活跃使用的块（ref_count > 0）
+    cached_blocks:   LRU 缓存的最近释放块（ref_count=0，有效 hash）
+
+块内存布局示意：
+    ──────────────────────────────────────────────────────────
+    | < computed (cached) > | < new tokens to compute >      |
+    ──────────────────────────────────────────────────────────
+    | < prefix-cached >     | < to be computed & allocated > |
+    ──────────────────────────────────────────────────────────
+"""
+
+from collections import OrderedDict, deque
 
 import numpy as np
 import xxhash
@@ -10,11 +29,10 @@ class Block:
     """KV-cache 块，通过引用计数管理生命周期，通过 hash 支持 prefix caching。"""
 
     def __init__(self, block_id):
-        """初始化为空闲状态 (ref_count=0, hash=-1)。"""
         self.block_id = block_id
-        self.ref_count = 0  # 引用计数，0表示空闲
-        self.hash = -1  # 块的哈希值，-1表示无效
-        self.token_ids = []  # 块内的token列表
+        self.ref_count = 0
+        self.hash = -1
+        self.token_ids = []
 
     def update(self, hash: int, token_ids: list[int]):
         """更新块的 hash 和 token 数据，用于建立 prefix caching 索引。"""
@@ -29,163 +47,265 @@ class Block:
 
 
 class BlockManager:
-    """管理所有 KV-cache 块的分配/释放，维护空闲队列、引用计数和 prefix caching 哈希表。"""
+    """
+    管理所有 KV-cache 块的分配/释放，支持：
+    - 基于 xxhash 的 prefix caching（O(1) 查找复用）
+    - LRU eviction（空闲块用完时驱逐最久未使用的缓存块）
+    - chunked prefill（一次分配多个新块）
+    """
 
-    def __init__(
-        self, num_blocks: int, block_size: int, enable_prefix_caching: bool = True
-    ):
-        """初始化块管理器，创建所有 block 实例并初始化空闲队列。"""
+    def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
-        self.enable_prefix_caching = enable_prefix_caching
-
-        # 创建所有块
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-
-        # 哈希到block ID的映射（用于prefix caching）
         self.hash_to_block_id: dict[int, int] = dict()
-
-        # 空闲块ID的双端队列（高效pop from left）
         self.free_block_ids: deque[int] = deque(range(num_blocks))
-
-        # 已使用块的集合
         self.used_block_ids: set[int] = set()
+        # LRU 缓存：hash → block_id，最近使用的在末尾
+        self.cached_blocks: OrderedDict[int, int] = OrderedDict()
+
+    @property
+    def num_free_blocks(self):
+        """总可用块数（真正空闲 + 可驱逐的 LRU 缓存块）。"""
+        return len(self.free_block_ids) + len(self.cached_blocks)
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
-        """计算 token 序列的链式 hash（xxhash），用于 prefix caching 块匹配。"""
+        """计算 token 序列的链式 hash（xxhash64），用于 prefix caching 块匹配。"""
         h = xxhash.xxh64()
-
-        # 如果有前缀，先添加前缀哈希
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
-
-        # 添加token数据
         h.update(np.array(token_ids).tobytes())
-
         return h.intdigest()
 
-    def _allocate_block(self, block_id: int) -> Block:
-        """分配指定 ID 的块：重置状态，从空闲队列移除，加入已使用集合。"""
+    # ── 内部块管理方法 ──
+
+    def _get_new_block_id(self) -> int:
+        """
+        获取一个可用块 ID：优先从真正空闲块取，
+        不够时按 LRU 顺序驱逐缓存块。返回 -1 表示 OOM。
+        """
+        if self.free_block_ids:
+            block_id = self.free_block_ids.popleft()
+        elif self.cached_blocks:
+            # LRU 驱逐：移除最久未使用的缓存块
+            evicted_hash, block_id = self.cached_blocks.popitem(last=False)
+            if self.hash_to_block_id.get(evicted_hash) == block_id:
+                del self.hash_to_block_id[evicted_hash]
+        else:
+            return -1  # OOM
+
+        block = self.blocks[block_id]
+        block.reset()
+        self.used_block_ids.add(block_id)
+        return block_id
+
+    def _revive_cached_block(self, block_id: int):
+        """将 LRU 缓存中的块恢复为活跃使用状态。"""
+        block = self.blocks[block_id]
+        if (
+            block.hash in self.cached_blocks
+            and self.cached_blocks.get(block.hash) == block_id
+        ):
+            del self.cached_blocks[block.hash]
+        block.ref_count = 1
+        self.used_block_ids.add(block_id)
+
+    def _release_block(self, block_id: int):
+        """释放块（ref_count 已为 0）。有 hash 的移入 LRU 缓存，否则归还空闲池。"""
         block = self.blocks[block_id]
         assert block.ref_count == 0
-        block.reset()
-        self.free_block_ids.remove(block_id)
-        self.used_block_ids.add(block_id)
-        return self.blocks[block_id]
+        self.used_block_ids.discard(block_id)
+        if block.hash != -1:
+            # 有效 hash：保留在 LRU 缓存中以备复用
+            self.cached_blocks[block.hash] = block_id
+            self.cached_blocks.move_to_end(block.hash)
+        else:
+            # 无 hash（不完整块）：直接归还空闲池
+            self.free_block_ids.append(block_id)
 
-    def _deallocate_block(self, block_id: int) -> Block:
-        """释放指定 ID 的块：从已使用集合移除，回收到空闲队列。"""
-        assert self.blocks[block_id].ref_count == 0
-        self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
+    # ── Waiting 队列操作 ──
 
-    def can_allocate(self, seq: Sequence) -> bool:
-        """检查空闲块是否足够分配给该序列。"""
-        return len(self.free_block_ids) >= seq.num_blocks
+    def get_token_layout(self, seq: Sequence):
+        """
+        分析 waiting 队列序列的 prefix cache 命中情况。
 
-    def allocate(self, seq: Sequence):
-        """为序列分配 KV-cache 块，优先复用 prefix caching 命中的块。"""
+        Returns:
+            (num_computed_in_used, num_computed_in_cached, num_new_tokens)
+            - num_computed_in_used:  命中活跃块的 token 数（ref_count > 0）
+            - num_computed_in_cached: 命中 LRU 缓存块的 token 数（需要恢复）
+            - num_new_tokens: 需要计算的新 token 数
+        """
         assert not seq.block_table
-
+        num_new_tokens = 0
+        num_computed_in_used = 0
+        num_computed_in_cached = 0
         h = -1
-        cache_miss = not self.enable_prefix_caching  # 未启用时视为全部 miss
+        cache_miss = False
 
-        # 遍历序列的每个block
         for i in range(seq.num_blocks):
-            # 获取该block的token
             token_ids = seq.block(i)
-
-            # 计算哈希（仅对满的block计算，且启用 prefix caching 时才有意义）
             h = (
                 self.compute_hash(token_ids, h)
-                if self.enable_prefix_caching and len(token_ids) == self.block_size
+                if len(token_ids) == self.block_size
                 else -1
             )
-
-            # 查找缓存的块
             block_id = self.hash_to_block_id.get(h, -1)
 
-            # 检查是否真正命中缓存（哈希冲突检查）
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                cache_miss = True  # 缓存未命中
+            if (
+                block_id == -1
+                or self.blocks[block_id].token_ids != token_ids
+                or i == seq.num_blocks - 1
+            ):
+                cache_miss = True
 
             if cache_miss:
-                # 缓存未命中：从空闲池分配新块
-                block_id = self.free_block_ids[0]
-                block = self._allocate_block(block_id)
+                num_new_tokens += len(token_ids)
             else:
-                # 缓存命中：可能共享已有块
-                seq.num_cached_tokens += self.block_size  # 增加缓存token计数
-
                 if block_id in self.used_block_ids:
-                    # 块正在使用中，增加引用计数
-                    block = self.blocks[block_id]
-                    block.ref_count += 1
+                    num_computed_in_used += len(token_ids)
                 else:
-                    # 块是空闲的，分配并初始化
-                    block = self._allocate_block(block_id)
+                    num_computed_in_cached += len(token_ids)
 
-            # 更新块的哈希和索引
+        return num_computed_in_used, num_computed_in_cached, num_new_tokens
+
+    def can_allocate(self, num_tokens: int) -> bool:
+        """检查可用块是否足够分配给定数量的新 token（waiting 队列用）。"""
+        return (
+            self.num_free_blocks
+            >= (num_tokens + self.block_size - 1) // self.block_size
+        )
+
+    def allocate(self, seq: Sequence):
+        """
+        为 waiting 队列序列分配 KV-cache 块。
+        第一阶段：复用 prefix cache 命中的块。
+        第二阶段：为剩余 token 分配新块。
+        """
+        assert not seq.block_table
+        h = -1
+
+        # 阶段1：匹配 prefix cache
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            h = (
+                self.compute_hash(token_ids, h)
+                if len(token_ids) == self.block_size
+                else -1
+            )
+            block_id = self.hash_to_block_id.get(h, -1)
+
+            if (
+                block_id == -1
+                or self.blocks[block_id].token_ids != token_ids
+                or i == seq.num_blocks - 1
+            ):
+                break  # Cache miss
+
+            seq.num_cached_tokens += self.block_size
+
+            if block_id in self.used_block_ids:
+                # 活跃块：增加引用计数
+                block = self.blocks[block_id]
+                block.ref_count += 1
+            else:
+                # LRU 缓存块：恢复为活跃使用
+                self._revive_cached_block(block_id)
+                block = self.blocks[block_id]
+
+            block.update(h, token_ids)
+            self.hash_to_block_id[h] = block_id
+            seq.block_table.append(block_id)
+
+        # 阶段2：为剩余 token 分配新块
+        start = seq.num_cached_tokens
+        end = seq.num_cached_tokens + seq.num_new_tokens
+        for i in range(start, end, self.block_size):
+            token_ids = seq[i : min(i + self.block_size, end)]
+            if i == start:
+                # h 继承自阶段1，仅当本块完整时才有效；
+                # chunked prefill 可能只部分填充该块，须置 h = -1
+                if len(token_ids) != self.block_size:
+                    h = -1
+            else:
+                h = (
+                    self.compute_hash(token_ids, h)
+                    if len(token_ids) == self.block_size
+                    else -1
+                )
+            block_id = self._get_new_block_id()
+            assert block_id != -1, "OOM: no free blocks available"
+            block = self.blocks[block_id]
             if h != -1:
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
-
-            # 记录到序列的block table
             seq.block_table.append(block_id)
 
     def deallocate(self, seq: Sequence):
-        """释放序列占用的所有块，递减引用计数，归零时回收到空闲池。"""
-        # 逆序遍历block table
+        """释放序列所有块。块根据 hash 状态移入 LRU 缓存或空闲池。"""
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
-            block.ref_count -= 1  # 减少引用计数
-
-            # 引用计数为0时可以释放
+            block.ref_count -= 1
             if block.ref_count == 0:
-                self._deallocate_block(block_id)
-
-        # 清空序列的缓存信息
+                self._release_block(block_id)
         seq.num_cached_tokens = 0
+        seq.num_new_tokens = 0
         seq.block_table.clear()
 
-    def can_append(self, seq: Sequence) -> bool:
-        """检查是否可以向序列追加新 token（当前 block 未满或有空闲块）。"""
-        # 需要新块的条件：当前长度 % block_size == 1
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+    # ── Running 队列操作 ──
+
+    def can_append(self, seq: Sequence, num_new_tokens: int) -> bool:
+        """
+        检查能否为 running 队列序列追加 num_new_tokens 个 token 的块。
+        支持 decode（1 个 token）和 chunked prefill（多个 token）。
+        """
+        last_block_capacity = self.block_size - (
+            seq.num_cached_tokens % self.block_size
+        )
+        if last_block_capacity == self.block_size:
+            last_block_capacity = 0
+        needed = max(
+            0,
+            (num_new_tokens - last_block_capacity + self.block_size - 1)
+            // self.block_size,
+        )
+        return self.num_free_blocks >= needed
 
     def may_append(self, seq: Sequence):
-        """为序列追加 token 做准备：block 刚满时分配新块，填满时计算 hash。"""
-        block_table = seq.block_table
-        last_block = self.blocks[block_table[-1]]
+        """
+        为 running 队列序列的新 token 分配/更新块。
+        同时处理 decode（1 个新 token）和 chunked prefill（多个新 token）。
+        满块时计算 hash 以支持后续 prefix caching。
+        """
+        start = seq.num_cached_blocks * self.block_size
+        end = seq.num_cached_tokens + seq.num_new_tokens
 
-        # 情况1：当前block刚满，需要新块
-        # 例如：block_size=256，当前长度=256*k + 1
-        if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
+        for i in range(start, end, self.block_size):
+            token_ids = seq[i : min(i + self.block_size, end)]
+            block_idx = i // self.block_size
+            current_block_id = (
+                seq.block_table[block_idx] if block_idx < len(seq.block_table) else -1
+            )
 
-            # 分配新块
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
+            if current_block_id != -1:
+                current_block = self.blocks[current_block_id]
+                assert current_block.hash == -1  # 不完整块不应有 hash
 
-        # 情况2：当前block刚填满，可以计算哈希
-        # 例如：block_size=256，当前长度=256*k
-        elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1
+            if len(token_ids) % self.block_size == 0:
+                # 块已满：计算 hash 用于 prefix caching
+                prev_block_id = seq.block_table[block_idx - 1] if block_idx > 0 else -1
+                prefix = self.blocks[prev_block_id].hash if prev_block_id != -1 else -1
+                h = self.compute_hash(token_ids, prefix)
 
-            # 获取刚填满的block的token
-            token_ids = seq.block(seq.num_blocks - 1)
+                if current_block_id == -1:
+                    block_id = self._get_new_block_id()
+                    assert block_id != -1
+                    current_block = self.blocks[block_id]
+                    seq.block_table.append(block_id)
 
-            # 计算前缀哈希
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-
-            # 计算当前block的哈希
-            h = self.compute_hash(token_ids, prefix)
-
-            # 更新块的哈希和索引
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
-
-        # 情况3：当前block未满，无需操作
-        else:
-            assert last_block.hash == -1
+                current_block.update(h, token_ids)
+                self.hash_to_block_id[h] = current_block.block_id
+            elif current_block_id == -1:
+                # 新的不完整块
+                block_id = self._get_new_block_id()
+                assert block_id != -1
+                seq.block_table.append(block_id)

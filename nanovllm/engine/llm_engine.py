@@ -1,15 +1,18 @@
 import atexit
+import gc
 from dataclasses import fields
 from time import perf_counter
+
+import torch
+import torch.multiprocessing as mp
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
-import torch.multiprocessing as mp
 
 from nanovllm.config import Config
-from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.sequence import Sequence
-from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.sequence import Sequence
+from nanovllm.sampling_params import SamplingParams
 
 
 class LLMEngine:
@@ -59,11 +62,15 @@ class LLMEngine:
 
     def exit(self):
         """发送 exit 指令给所有 ModelRunner，等待子进程结束，释放资源。"""
-        # 向主进程的 ModelRunner 发送退出指令
+        if not hasattr(self, "model_runner"):
+            return  # 初始化失败时安全退出
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
+        # 强制 Python GC 回收引用，再清理 CUDA 缓存，确保后续实例可获得足够显存
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         """将 prompt（字符串或 token ID 列表）封装为 Sequence 并加入调度器。"""
@@ -74,39 +81,28 @@ class LLMEngine:
 
     def step(self):
         """
-        执行一次推理步骤。
-
-        使用方法：
-        通常在generate()内部循环调用，不需要手动调用
-        output, num_tokens = llm.step()
-
-        使用场景：
-        1. generate()中的主循环，每次迭代调用一次
-        2. 手动控制推理过程时使用
-        3. 调试时观察每个step的行为
+        执行一次统一推理步骤（v1 风格）。
 
         返回值：
-        - outputs: 已完成序列的列表，每个元素为(seq_id, completion_token_ids)
-        - num_tokens: 本次处理的token数量
-          * 正数：表示prefill阶段处理的token数
-          * 负数：表示decode阶段的序列数（用于计算decode吞吐量）
-
-        执行流程：
-        1. 调度器选择待处理的序列批次
-        2. 调用ModelRunner执行模型推理
-        3. 调度器后处理，更新序列状态
-        4. 返回完成的序列和统计信息
+        - outputs: 已完成序列的 (seq_id, completion_token_ids) 列表
+        - num_prefill_tokens: 本次 prefill 处理的 token 数
+        - num_decode_tokens: 本次 decode 处理的序列数
         """
-        seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids)
+        seqs = self.scheduler.schedule()
+        if not seqs:
+            return [], 0, 0
+
+        # 在模型推理前计算指标（postprocess 会重置 num_new_tokens）
+        num_prefill_tokens = sum(s.num_new_tokens for s in seqs if s.num_new_tokens > 1)
+        num_decode_tokens = sum(1 for s in seqs if s.num_new_tokens == 1)
+
+        token_ids, seq_need_compute_logits = self.model_runner.call("run", seqs)
+        self.scheduler.postprocess(seqs, token_ids, seq_need_compute_logits)
 
         outputs = [
             (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
         ]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-
-        return outputs, num_tokens
+        return outputs, num_prefill_tokens, num_decode_tokens
 
     def is_finished(self):
         """检查所有请求是否已完成。"""
@@ -143,13 +139,14 @@ class LLMEngine:
 
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            output, num_prefill, num_decode = self.step()
+            elapsed = perf_counter() - t
 
             if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                if num_prefill > 0:
+                    prefill_throughput = num_prefill / elapsed
+                if num_decode > 0:
+                    decode_throughput = num_decode / elapsed
                 pbar.set_postfix(
                     {
                         "Prefill": f"{int(prefill_throughput)}tok/s",

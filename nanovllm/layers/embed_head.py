@@ -21,9 +21,9 @@
 """
 
 import torch
-from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn.functional as F
+from torch import nn
 
 from nanovllm.utils.context import get_context
 
@@ -93,13 +93,18 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
-        """hidden state -> logits，prefill时只取末位token，tensor parallel时gather聚合。"""
+        """hidden state -> logits，通过 seq_need_compute_logits 选择需要 logits 的序列。"""
         context = get_context()
 
-        if context.is_prefill:
-            # prefill阶段只需最后一个token的logits
-            last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
+        # 获取每个序列的最后一个 token 位置
+        last_indices = context.cu_seqlens_q[1:] - 1
+        # 过滤到需要计算 logits 的序列（chunked prefill 中未完成的序列不需要）
+        if (
+            context.seq_need_compute_logits is not None
+            and context.seq_need_compute_logits.numel()
+        ):
+            last_indices = last_indices[context.seq_need_compute_logits]
+        x = x[last_indices].contiguous()
 
         logits = F.linear(x, self.weight)
 

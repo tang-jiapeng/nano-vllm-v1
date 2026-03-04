@@ -10,7 +10,11 @@ import triton
 import triton.language as tl
 from torch import nn
 
-from nanovllm.kernels.attention import flash_atten_prefill, paged_attention_decode
+from nanovllm.kernels.attention import (
+    flash_atten_prefill,
+    flash_atten_prefill_paged,
+    paged_attention_decode,
+)
 from nanovllm.utils.context import get_context
 
 try:
@@ -87,9 +91,9 @@ class Attention(nn.Module):
 
     后端选择策略:
         - flash-attn 可用时: 使用 flash_attn_varlen_func / flash_attn_with_kvcache
-          （支持 prefix caching）
         - flash-attn 不可用时: 回退到 Triton 自实现 flash_atten_prefill /
-          paged_attention_decode（不支持 prefix caching）
+          flash_atten_prefill_paged / paged_attention_decode
+        两种后端均支持 prefix caching。
     """
 
     def __init__(
@@ -154,20 +158,35 @@ class Attention(nn.Module):
         v: torch.Tensor,
         context,
     ) -> torch.Tensor:
-        """使用 Triton 自实现 kernel 执行 attention。"""
+        """使用 Triton 自实现 kernel 执行 attention（支持 prefix caching）。"""
         k_cache, v_cache = self.k_cache, self.v_cache
 
         if context.is_prefill:
-            return flash_atten_prefill(
-                q,
-                k,
-                v,
-                cu_seqlens=context.cu_seqlens_q,
-                scale=self.scale,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-            )
+            if context.block_tables is not None:
+                # Prefix caching: Q 仅含新增 token，K/V 从 paged cache 读取
+                return flash_atten_prefill_paged(
+                    q,
+                    k_cache,
+                    v_cache,
+                    block_tables=context.block_tables,
+                    cu_seqlens_q=context.cu_seqlens_q,
+                    cu_seqlens_k=context.cu_seqlens_k,
+                    scale=self.scale,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                )
+            else:
+                return flash_atten_prefill(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens=context.cu_seqlens_q,
+                    scale=self.scale,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                )
         else:
             return paged_attention_decode(
                 q,

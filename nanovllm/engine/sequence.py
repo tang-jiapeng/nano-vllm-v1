@@ -42,6 +42,9 @@ class Sequence:
         # 已缓存的token数（prefix caching）
         self.num_cached_tokens = 0
 
+        # 本次调度需计算的新 token 数（由 scheduler 设置）
+        self.num_new_tokens = 0
+
         # KV-cache块表，记录该序列使用的所有块
         self.block_table = []
 
@@ -67,6 +70,11 @@ class Sequence:
     def num_completion_tokens(self):
         """已生成的 completion token 数。"""
         return self.num_tokens - self.num_prompt_tokens
+
+    @property
+    def num_context_tokens(self):
+        """当前 KV cache 覆盖的 token 数（cached + new）。"""
+        return self.num_cached_tokens + self.num_new_tokens
 
     @property
     def prompt_token_ids(self):
@@ -105,30 +113,27 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        """pickle 序列化：无 completion 时保存完整 token_ids，否则仅保存 last_token 以减少通信量。"""
+        """pickle 序列化：用于 tensor parallel 跨进程传输。"""
         return (
+            self.token_ids,
+            self.last_token,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
+            self.num_new_tokens,
             self.block_table,
-            # 优化：如果没有completion，保存完整token_ids；否则只保存last_token
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            self.temperature,
         )
 
     def __setstate__(self, state):
-        """pickle 反序列化：恢复元数据及 token 信息，seq_id 和 status 需外部同步。"""
-        # 恢复元数据
+        """pickle 反序列化：恢复序列状态。"""
         (
+            self.token_ids,
+            self.last_token,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
+            self.num_new_tokens,
             self.block_table,
-        ) = state[:-1]
-
-        # 恢复token数据
-        if self.num_completion_tokens == 0:
-            # 没有completion，完整token_ids直接可用
-            self.token_ids = state[-1]
-        else:
-            # 有completion，只保存了last_token
-            self.last_token = state[-1]
+            self.temperature,
+        ) = state

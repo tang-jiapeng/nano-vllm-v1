@@ -46,6 +46,7 @@ if __name__ == "__main__":
         "--model-path", type=str, default="./models/Qwen3-0.6B"
     )
     argparse.add_argument("--tensor-parallel-size", "--tp", type=int, default=1)
+    argparse.add_argument("--chunked-prefill", action="store_true")
     argparse.add_argument("--enforce-eager", type=bool, default=True)
     argparse.add_argument("--temperature", type=float, default=0.6)
     argparse.add_argument("--max-tokens", type=int, default=256)
