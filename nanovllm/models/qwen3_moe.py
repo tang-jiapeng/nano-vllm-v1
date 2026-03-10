@@ -1,6 +1,5 @@
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3MoeConfig
 
@@ -12,6 +11,10 @@ from nanovllm.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+)
+from nanovllm.layers.quantization.fused_moe import (
+    AWQFusedMoEMethod,
+    UnquantizedFusedMoEMethod,
 )
 from nanovllm.layers.rotary_embedding import get_rope
 
@@ -144,82 +147,30 @@ class Qwen3MoeMLP(nn.Module):
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
+    """Qwen3-MoE sparse block with stacked expert weights and fused MoE."""
+
     def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
+
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+
         awq_config = getattr(config, "_awq_config", None)
+        if awq_config is None:
+            self.moe_method = UnquantizedFusedMoEMethod()
+        else:
+            self.moe_method = AWQFusedMoEMethod(awq_config)
 
-        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [
-                Qwen3MoeMLP(
-                    hidden_size=config.hidden_size,
-                    intermediate_size=config.moe_intermediate_size,
-                    hidden_act=config.hidden_act,
-                    awq_config=awq_config,
-                )
-                for _ in range(self.num_experts)
-            ]
+        self.moe_method.create_weights(
+            self, config.num_experts, config.hidden_size, config.moe_intermediate_size
         )
 
-    def forward(self, hidden_states: torch.Tensor):
-        seq_len, hidden_dim = hidden_states.shape
-
-        # 路由打分 (Router Logits)
-        # 输入: [seq_len, hidden_dim] -> 输出: [seq_len, num_experts]
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits = self.gate(hidden_states)
-
-        # 计算路由权重与 Top-K 选择
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        # routing_weights: 每个 token 选中的 K 个专家的权重
-        # selected_experts: 这 K 个专家的索引 (ID)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
+        return self.moe_method.apply(
+            self, hidden_states, router_logits, self.top_k, self.norm_topk_prob
         )
-
-        # 根据配置决定是否对 Top-K 权重重新归一化
-        if self.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states.dtype)
-
-        # 初始化最终输出的张量，全为 0
-        final_hidden_states = torch.zeros(
-            hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device
-        )
-
-        # 构造专家分配掩码 (One-hot 编码)
-        # shape: [num_experts, top_k, seq_len]
-        experts_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
-
-        # 找出当前 batch 中，有哪些专家被至少一个 Token 命中了
-        expert_hitted = torch.greater(experts_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        # 专家分发与计算 (Dispatch & Compute)
-        for experts_idx in expert_hitted:
-            expert_layer = self.experts[experts_idx]
-
-            # idx: Token 属于它的第几个选择 (top-1 还是 top-2)
-            # top_x: 具体的 Token 索引
-            idx, top_x = torch.where(experts_mask[experts_idx].squeeze(0))
-
-            # 收集属于当前专家的所有 Token 数据 (Gather)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-
-            # 送入对应的专家 MLP 进行前向传播，并乘路由权重
-            current_hidden_states = (
-                expert_layer(current_state) * routing_weights[top_x, idx, None]
-            )
-
-            final_hidden_states.index_add_(
-                0, top_x, current_hidden_states.to(hidden_states.dtype)
-            )
-
-        return final_hidden_states
 
 
 class Qwen3MoeDecoderLayer(nn.Module):

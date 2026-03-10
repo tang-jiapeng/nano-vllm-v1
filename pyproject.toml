@@ -16,10 +16,14 @@ dependencies = [
     "triton>=3.0.0",
     "transformers>=4.51.0",
     "xxhash",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
 ]
 
 [project.optional-dependencies]
 flash-attn = ["flash-attn"]
+prometheus = ["prometheus-client"]
+all = ["flash-attn", "prometheus-client", "openai"]
 
 [project.urls]
 Homepage="https://github.com/tang-jiapeng/nano-vllm"

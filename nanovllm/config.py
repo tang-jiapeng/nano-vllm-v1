@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from transformers import AutoConfig
 
-from nanovllm.layers.quantization.quant_method import AWQConfig
+from nanovllm.layers.quantization.awq_config import AWQConfig
 
 try:
     import flash_attn as _  # noqa: F401
@@ -39,15 +39,15 @@ class Config:
         if HAS_FLASH_ATTN:
             assert (
                 self.kvcache_block_size % 256 == 0
-            ), "flash-attn 要求 kvcache_block_size 为 256 的倍数"
+            ), "flash-attn requires kvcache_block_size to be a multiple of 256"
         else:
             assert (
                 self.kvcache_block_size >= 16
                 and (self.kvcache_block_size & (self.kvcache_block_size - 1)) == 0
-            ), "kvcache_block_size 必须为 ≥16 的 2 的幂"
+            ), "kvcache_block_size must be a power of 2 and >= 16"
             logger.warning(
-                "flash-attn 未安装，将使用 Triton 自实现 attention kernel。"
-                "安装 flash-attn 以获得最佳性能: pip install flash-attn"
+                "flash-attn is not installed, using Triton attention kernel. "
+                "Install flash-attn for best performance: pip install flash-attn"
             )
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
@@ -56,21 +56,9 @@ class Config:
         )
         assert self.max_num_batched_tokens >= self.max_model_len
 
-        # MoE 模型的前向传播使用 nonzero()/torch.where() 等动态形状操作，
-        # 与 CUDA Graph 捕获不兼容，自动强制启用 eager 模式。
-        _MOE_MODEL_TYPES = {"qwen3_moe"}
-        if self.hf_config.model_type in _MOE_MODEL_TYPES and not self.enforce_eager:
-            logger.warning(
-                f"检测到 MoE 模型（model_type={self.hf_config.model_type!r}），"
-                "其前向传播中含有动态形状操作（nonzero/torch.where），"
-                "与 CUDA Graph 不兼容，已自动启用 enforce_eager=True。"
-            )
-            self.enforce_eager = True
-
-        # 自动检测 AWQ 量化配置
         self.awq_config = AWQConfig.from_json(self.model)
         if self.awq_config is not None:
             logger.info(
-                f"检测到 AWQ 量化模型（weight_bits={self.awq_config.weight_bits}, "
-                f"group_size={self.awq_config.group_size}）。"
+                f"Detected AWQ quantized model (weight_bits={self.awq_config.weight_bits}, "
+                f"group_size={self.awq_config.group_size})"
             )

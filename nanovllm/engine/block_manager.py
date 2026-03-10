@@ -68,6 +68,23 @@ class BlockManager:
         """总可用块数（真正空闲 + 可驱逐的 LRU 缓存块）。"""
         return len(self.free_block_ids) + len(self.cached_blocks)
 
+    @property
+    def total_blocks(self) -> int:
+        """总 KV-cache 块数。"""
+        return len(self.blocks)
+
+    @property
+    def used_blocks(self) -> int:
+        """已使用的 KV-cache 块数。"""
+        return len(self.used_block_ids)
+
+    @property
+    def usage_ratio(self) -> float:
+        """KV-cache 使用率 (0.0 ~ 1.0)。"""
+        if self.total_blocks == 0:
+            return 0.0
+        return self.used_blocks / self.total_blocks
+
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         """计算 token 序列的链式 hash（xxhash64），用于 prefix caching 块匹配。"""

@@ -9,6 +9,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from nanovllm.config import Config
+from nanovllm.engine.metrics import InferenceMetrics
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.sequence import Sequence
@@ -57,6 +58,7 @@ class LLMEngine:
         config.eos = self.tokenizer.eos_token_id
 
         self.scheduler = Scheduler(config)
+        self.metrics = InferenceMetrics()
 
         atexit.register(self.exit)
 
@@ -72,37 +74,67 @@ class LLMEngine:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        """将 prompt（字符串或 token ID 列表）封装为 Sequence 并加入调度器。"""
+    def add_request(
+        self, prompt: str | list[int], sampling_params: SamplingParams
+    ) -> int:
+        """将 prompt（字符串或 token ID 列表）封装为 Sequence 并加入调度器。返回 seq_id。"""
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        self.metrics.on_request_arrival(seq.seq_id, len(prompt))
+        return seq.seq_id
 
     def step(self):
         """
         执行一次统一推理步骤（v1 风格）。
 
         返回值：
-        - outputs: 已完成序列的 (seq_id, completion_token_ids) 列表
+        - finished_outputs: 已完成序列的 (seq_id, completion_token_ids) 列表
+        - incremental_outputs: 未完成但有新 token 的 (seq_id, last_token_id) 列表
         - num_prefill_tokens: 本次 prefill 处理的 token 数
         - num_decode_tokens: 本次 decode 处理的序列数
         """
         seqs = self.scheduler.schedule()
         if not seqs:
-            return [], 0, 0
+            return [], [], 0, 0
 
         # 在模型推理前计算指标（postprocess 会重置 num_new_tokens）
         num_prefill_tokens = sum(s.num_new_tokens for s in seqs if s.num_new_tokens > 1)
         num_decode_tokens = sum(1 for s in seqs if s.num_new_tokens == 1)
 
         token_ids, seq_need_compute_logits = self.model_runner.call("run", seqs)
+        # 记录本步获得新 token 的序列索引
+        new_token_indices = set(seq_need_compute_logits)
         self.scheduler.postprocess(seqs, token_ids, seq_need_compute_logits)
 
-        outputs = [
-            (seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished
-        ]
-        return outputs, num_prefill_tokens, num_decode_tokens
+        finished_outputs = []
+        incremental_outputs = []
+        for idx, seq in enumerate(seqs):
+            if idx in new_token_indices:
+                # 该序列本步获得了新 token
+                self.metrics.on_token_generated(seq.seq_id)
+                if seq.is_finished:
+                    finished_outputs.append((seq.seq_id, seq.completion_token_ids))
+                    self.metrics.on_request_finished(seq.seq_id)
+                else:
+                    incremental_outputs.append((seq.seq_id, seq.last_token))
+
+        # 更新全局状态指标
+        self.metrics.on_step(
+            num_waiting=len(self.scheduler.waiting),
+            num_running=len(self.scheduler.running),
+            kv_cache_usage=self.scheduler.block_manager.usage_ratio,
+            num_prefill=num_prefill_tokens,
+            num_decode=num_decode_tokens,
+        )
+
+        return (
+            finished_outputs,
+            incremental_outputs,
+            num_prefill_tokens,
+            num_decode_tokens,
+        )
 
     def is_finished(self):
         """检查所有请求是否已完成。"""
@@ -139,7 +171,7 @@ class LLMEngine:
 
         while not self.is_finished():
             t = perf_counter()
-            output, num_prefill, num_decode = self.step()
+            output, _incremental, num_prefill, num_decode = self.step()
             elapsed = perf_counter() - t
 
             if use_tqdm:

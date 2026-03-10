@@ -3,11 +3,11 @@
 from abc import abstractmethod
 
 import torch
-from torch import nn
 import torch.distributed as dist
+from torch import nn
 
-from nanovllm.layers.quantization.quant_method import (
-    AWQConfig,
+from nanovllm.layers.quantization.awq_config import AWQConfig
+from nanovllm.layers.quantization.linear import (
     AWQLinearMethod,
     LinearMethodBase,
     UnquantizedLinearMethod,
@@ -111,7 +111,11 @@ class ColumnParallelLinear(LinearBase):
     ):
         tp_size = dist.get_world_size()
         super().__init__(
-            input_size, divide(output_size, tp_size), bias, tp_dim=0, awq_config=awq_config
+            input_size,
+            divide(output_size, tp_size),
+            bias,
+            tp_dim=0,
+            awq_config=awq_config,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -245,7 +249,11 @@ class RowParallelLinear(LinearBase):
     ):
         tp_size = dist.get_world_size()
         super().__init__(
-            divide(input_size, tp_size), output_size, bias, tp_dim=1, awq_config=awq_config
+            divide(input_size, tp_size),
+            output_size,
+            bias,
+            tp_dim=1,
+            awq_config=awq_config,
         )
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):

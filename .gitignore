@@ -196,6 +196,9 @@ cython_debug/
 Qwen3-0.6B/
 Qwen3-4B-AWQ/
 Qwen3-MOE-AWQ/
+Qwen3-VL-2B-Instruct/
+
+results/
 
 docs/
 
