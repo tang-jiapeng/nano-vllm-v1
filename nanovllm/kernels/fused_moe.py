@@ -19,16 +19,10 @@ from nanovllm.utils.context import get_context
             {"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 32}, num_warps=4, num_stages=3
         ),
         triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=2
-        ),
-        triton.Config(
             {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64}, num_warps=4, num_stages=2
         ),
         triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}, num_warps=4, num_stages=2
+            {"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 32}, num_warps=4, num_stages=3
         ),
     ],
     key=["N", "K"],
@@ -79,12 +73,14 @@ def fused_moe_kernel(
     num_valid = tl.load(num_valid_tokens_ptr + pid_m)
 
     # ── 计算偏移 ──
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # ── 通过 sorted_token_ids 间接索引，避免 tile 边界处越界 ──
+    offs_tile = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    token_ids = tl.load(sorted_token_ids_ptr + offs_tile)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
-    # A 指针: A[offs_m, 0:K]
-    a_ptrs = A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    # A 指针: 通过 token_ids 间接寻址
+    a_ptrs = A_ptr + token_ids[:, None] * stride_am + offs_k[None, :] * stride_ak
     # B 指针: B[expert_id, offs_n, 0:K]
     b_ptrs = (
         B_ptr
@@ -119,44 +115,51 @@ def fused_moe_kernel(
     # ── 写回 C ──
     mask_m = tl.arange(0, BLOCK_M) < num_valid
     mask_n = offs_n < N
-    c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_ptrs = C_ptr + token_ids[:, None] * stride_cm + offs_n[None, :] * stride_cn
     tl.store(
         c_ptrs, acc.to(C_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :]
     )
 
 
 def _prepare_expert_mapping(
-    sorted_expert_ids: torch.Tensor,  # [T*K] 已按 expert 排序的 expert id
     tokens_per_expert: torch.Tensor,  # [E] 每个 expert 的 token 数
     block_m: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    为 Triton kernel 准备 expert_ids 和 num_valid_tokens 映射。
+    为 Triton kernel 准备 tile → expert 映射与 token 间接索引表。
 
     Returns:
-        expert_ids: [num_tiles_m]        每个 M-tile 属于哪个 expert
-        num_valid:  [num_tiles_m]        每个 M-tile 中的有效 token 数
+        expert_ids:       [num_tiles_m]            每个 M-tile 属于哪个 expert
+        num_valid:        [num_tiles_m]            每个 M-tile 中的有效 token 数
+        sorted_token_ids: [num_tiles_m * block_m]  tile 行号 → 实际 A 行号的映射
     """
     E = tokens_per_expert.shape[0]
-    expert_ids_list = []
-    num_valid_list = []
+    expert_ids_list: list[int] = []
+    num_valid_list: list[int] = []
+    token_ids_list: list[int] = []
 
+    row_offset = 0
     for e in range(E):
-        n = tokens_per_expert[e].item()
+        n = int(tokens_per_expert[e].item())
         if n == 0:
             continue
-        full_tiles = n // block_m
-        remainder = n % block_m
-        expert_ids_list.extend([e] * full_tiles)
-        num_valid_list.extend([block_m] * full_tiles)
-        if remainder > 0:
+        num_tiles = (n + block_m - 1) // block_m
+        for t in range(num_tiles):
             expert_ids_list.append(e)
-            num_valid_list.append(remainder)
+            valid = min(block_m, n - t * block_m)
+            num_valid_list.append(valid)
+            for i in range(block_m):
+                if i < valid:
+                    token_ids_list.append(row_offset + t * block_m + i)
+                else:
+                    token_ids_list.append(0)  # 安全填充索引（被 mask 屏蔽）
+        row_offset += n
 
-    device = sorted_expert_ids.device
     expert_ids = torch.tensor(expert_ids_list, dtype=torch.int32, device=device)
     num_valid = torch.tensor(num_valid_list, dtype=torch.int32, device=device)
-    return expert_ids, num_valid
+    sorted_token_ids = torch.tensor(token_ids_list, dtype=torch.int32, device=device)
+    return expert_ids, num_valid, sorted_token_ids
 
 
 def triton_fused_moe_gemm(
@@ -164,13 +167,13 @@ def triton_fused_moe_gemm(
     B: torch.Tensor,  # [E, N, K]
     expert_ids: torch.Tensor,  # [num_tiles_m]
     num_valid: torch.Tensor,  # [num_tiles_m]
+    sorted_token_ids: torch.Tensor,  # [num_tiles_m * BLOCK_M]
 ) -> torch.Tensor:
     """
-    调用 Triton fused_moe_kernel 执行所有 expert 的 GEMM
+    调用 Triton fused_moe_kernel 执行所有 expert 的 GEMM。
 
-    等价于:
-        for tile_m, expert in enumerate(expert_ids):
-            C[tile_m*BM:(tile_m+1)*BM] = A[tile_m*BM:(tile_m+1)*BM] @ B[expert].T
+    通过 sorted_token_ids 间接索引，每个 tile 正确读取属于对应 expert
+    的 token 行，避免跨 expert 边界越界。
     """
     M_total = A.shape[0]
     E, N, K = B.shape
@@ -185,7 +188,7 @@ def triton_fused_moe_gemm(
         A,
         B,
         C,
-        torch.arange(M_total, device=A.device),  # sorted_token_ids (identity)
+        sorted_token_ids,
         expert_ids,
         num_valid,
         N=N,
@@ -285,15 +288,19 @@ def _fused_moe_fp_prefill(
     )
 
     BLOCK_M = 16
-    expert_ids, num_valid = _prepare_expert_mapping(
-        sorted_ids, tokens_per_expert, BLOCK_M
+    expert_ids, num_valid, sorted_token_ids = _prepare_expert_mapping(
+        tokens_per_expert, BLOCK_M, hidden_states.device
     )
 
-    intermediate = triton_fused_moe_gemm(dispatched, w1, expert_ids, num_valid)
+    intermediate = triton_fused_moe_gemm(
+        dispatched, w1, expert_ids, num_valid, sorted_token_ids
+    )
     gate = intermediate[:, :FFN]
     up = intermediate[:, FFN:]
     inter2 = F.silu(gate) * up
-    output_flat = triton_fused_moe_gemm(inter2, w2, expert_ids, num_valid)
+    output_flat = triton_fused_moe_gemm(
+        inter2, w2, expert_ids, num_valid, sorted_token_ids
+    )
 
     output_flat = output_flat * sorted_w.unsqueeze(-1)
     output_flat = output_flat[unsorter].view(T, top_k, D)
