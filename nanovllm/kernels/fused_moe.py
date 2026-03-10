@@ -548,5 +548,5 @@ def fused_moe(
         )
 
     raise ValueError(
-        "fused_moe 需要提供 FP 权重 (w1/w2) 或 AWQ 权重 (qweight/qzeros/scales)"
+        "fused_moe requires either FP weights (w1/w2) or AWQ weights (qweight/qzeros/scales)"
     )

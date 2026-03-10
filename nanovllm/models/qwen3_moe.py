@@ -3,7 +3,6 @@ import torch.distributed as dist
 from torch import nn
 from transformers import Qwen3MoeConfig
 
-from nanovllm.kernels.fused_moe import fused_moe
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -12,6 +11,10 @@ from nanovllm.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+)
+from nanovllm.layers.quantization.fused_moe import (
+    AWQFusedMoEMethod,
+    UnquantizedFusedMoEMethod,
 )
 from nanovllm.layers.rotary_embedding import get_rope
 
@@ -144,212 +147,29 @@ class Qwen3MoeMLP(nn.Module):
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
-    """Qwen3-MoE 稀疏块（堆叠权重 + fused_moe）。"""
+    """Qwen3-MoE sparse block with stacked expert weights and fused MoE."""
 
     def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
-        self.intermediate_size = config.moe_intermediate_size
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
+
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+
         awq_config = getattr(config, "_awq_config", None)
-        self.is_awq = awq_config is not None
-
-        self.gate = nn.Linear(self.hidden_size, self.num_experts, bias=False)
-
-        if not self.is_awq:
-            self.w1 = nn.Parameter(
-                torch.empty(
-                    self.num_experts,
-                    2 * self.intermediate_size,
-                    self.hidden_size,
-                )
-            )
-            self.w2 = nn.Parameter(
-                torch.empty(
-                    self.num_experts,
-                    self.hidden_size,
-                    self.intermediate_size,
-                )
-            )
-            self.w1.weight_loader = self.w1_weight_loader
-            self.w2.weight_loader = self.w2_weight_loader
+        if awq_config is None:
+            self.moe_method = UnquantizedFusedMoEMethod()
         else:
-            g = awq_config.group_size
-            p = awq_config.pack_factor
-            self.pack_factor = p
+            self.moe_method = AWQFusedMoEMethod(awq_config)
 
-            self.w1_qweight = nn.Parameter(
-                torch.empty(
-                    self.num_experts,
-                    self.hidden_size,
-                    (2 * self.intermediate_size) // p,
-                    dtype=torch.int32,
-                ),
-                requires_grad=False,
-            )
-            self.w1_qzeros = nn.Parameter(
-                torch.empty(
-                    self.num_experts,
-                    self.hidden_size // g,
-                    (2 * self.intermediate_size) // p,
-                    dtype=torch.int32,
-                ),
-                requires_grad=False,
-            )
-            self.w1_scales = nn.Parameter(
-                torch.empty(
-                    self.num_experts,
-                    self.hidden_size // g,
-                    2 * self.intermediate_size,
-                    dtype=torch.float16,
-                ),
-                requires_grad=False,
-            )
-
-            self.w2_qweight = nn.Parameter(
-                torch.empty(
-                    self.num_experts,
-                    self.intermediate_size,
-                    self.hidden_size // p,
-                    dtype=torch.int32,
-                ),
-                requires_grad=False,
-            )
-            self.w2_qzeros = nn.Parameter(
-                torch.empty(
-                    self.num_experts,
-                    self.intermediate_size // g,
-                    self.hidden_size // p,
-                    dtype=torch.int32,
-                ),
-                requires_grad=False,
-            )
-            self.w2_scales = nn.Parameter(
-                torch.empty(
-                    self.num_experts,
-                    self.intermediate_size // g,
-                    self.hidden_size,
-                    dtype=torch.float16,
-                ),
-                requires_grad=False,
-            )
-
-            self.w1_qweight.weight_loader = self.w1_qweight_loader
-            self.w1_qzeros.weight_loader = self.w1_qzeros_loader
-            self.w1_scales.weight_loader = self.w1_scales_loader
-            self.w2_qweight.weight_loader = self.w2_qweight_loader
-            self.w2_qzeros.weight_loader = self.w2_qzeros_loader
-            self.w2_scales.weight_loader = self.w2_scales_loader
-
-    def w1_weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        expert_id: int,
-        loaded_shard_id: int,
-    ):
-        shard_size = self.intermediate_size
-        shard_offset = loaded_shard_id * shard_size
-        param.data[expert_id, shard_offset : shard_offset + shard_size].copy_(
-            loaded_weight
+        self.moe_method.create_weights(
+            self, config.num_experts, config.hidden_size, config.moe_intermediate_size
         )
 
-    def w2_weight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        expert_id: int,
-    ):
-        param.data[expert_id].copy_(loaded_weight)
-
-    def w1_qweight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        expert_id: int,
-        loaded_shard_id: int,
-    ):
-        shard_size = self.intermediate_size // self.pack_factor
-        shard_offset = loaded_shard_id * shard_size
-        param.data[expert_id, :, shard_offset : shard_offset + shard_size].copy_(
-            loaded_weight
-        )
-
-    def w1_qzeros_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        expert_id: int,
-        loaded_shard_id: int,
-    ):
-        shard_size = self.intermediate_size // self.pack_factor
-        shard_offset = loaded_shard_id * shard_size
-        param.data[expert_id, :, shard_offset : shard_offset + shard_size].copy_(
-            loaded_weight
-        )
-
-    def w1_scales_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        expert_id: int,
-        loaded_shard_id: int,
-    ):
-        shard_size = self.intermediate_size
-        shard_offset = loaded_shard_id * shard_size
-        param.data[expert_id, :, shard_offset : shard_offset + shard_size].copy_(
-            loaded_weight
-        )
-
-    def w2_qweight_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        expert_id: int,
-    ):
-        param.data[expert_id].copy_(loaded_weight)
-
-    def w2_qzeros_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        expert_id: int,
-    ):
-        param.data[expert_id].copy_(loaded_weight)
-
-    def w2_scales_loader(
-        self,
-        param: nn.Parameter,
-        loaded_weight: torch.Tensor,
-        expert_id: int,
-    ):
-        param.data[expert_id].copy_(loaded_weight)
-
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits = self.gate(hidden_states)
-        if self.is_awq:
-            return fused_moe(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                top_k=self.top_k,
-                norm_topk_prob=self.norm_topk_prob,
-                w1_qweight=self.w1_qweight,
-                w1_qzeros=self.w1_qzeros,
-                w1_scales=self.w1_scales,
-                w2_qweight=self.w2_qweight,
-                w2_qzeros=self.w2_qzeros,
-                w2_scales=self.w2_scales,
-            )
-
-        return fused_moe(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            top_k=self.top_k,
-            norm_topk_prob=self.norm_topk_prob,
-            w1=self.w1,
-            w2=self.w2,
+        return self.moe_method.apply(
+            self, hidden_states, router_logits, self.top_k, self.norm_topk_prob
         )
 
 
