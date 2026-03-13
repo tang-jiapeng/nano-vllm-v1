@@ -96,15 +96,16 @@ class ParallelLMHead(VocabParallelEmbedding):
         """hidden state -> logits，通过 seq_need_compute_logits 选择需要 logits 的序列。"""
         context = get_context()
 
-        # 获取每个序列的最后一个 token 位置
-        last_indices = context.cu_seqlens_q[1:] - 1
-        # 过滤到需要计算 logits 的序列（chunked prefill 中未完成的序列不需要）
-        if (
-            context.seq_need_compute_logits is not None
-            and context.seq_need_compute_logits.numel()
-        ):
-            last_indices = last_indices[context.seq_need_compute_logits]
-        x = x[last_indices].contiguous()
+        # 仅在 prefill 且非 speculative verify 阶段取每个序列最后位置。
+        # decode / speculative verify 路径需要保留全部位置的 hidden states。
+        if context.is_prefill and (not context.is_speculative):
+            last_indices = context.cu_seqlens_q[1:] - 1
+            if (
+                context.seq_need_compute_logits is not None
+                and context.seq_need_compute_logits.numel()
+            ):
+                last_indices = last_indices[context.seq_need_compute_logits]
+            x = x[last_indices].contiguous()
 
         logits = F.linear(x, self.weight)
 

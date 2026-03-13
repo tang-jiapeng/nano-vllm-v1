@@ -25,12 +25,20 @@ class Scheduler:
 
     def __init__(self, config: Config):
         self.enable_chunked = config.chunked_prefill
+        self.speculative_decoding = (
+            config.speculative_model is not None and config.num_speculative_tokens > 0
+        )
+        self.num_speculative_tokens = config.num_speculative_tokens
         self.max_model_len = config.max_model_len
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_manager = BlockManager(
-            config.num_kvcache_blocks, config.kvcache_block_size
+            config.num_kvcache_blocks,
+            config.kvcache_block_size,
+            num_draft_blocks=config.num_draft_kvcache_blocks,
+            speculative_decoding=self.speculative_decoding,
+            num_speculative_tokens=self.num_speculative_tokens,
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -161,6 +169,63 @@ class Scheduler:
 
         for seq_index, token_id in zip(seq_need_compute_logits, token_ids):
             seq = seqs[seq_index]
+
+            if seq.is_speculative:
+                accepted_count = len(seq.pending_accepted_tokens)
+
+                if accepted_count > 0:
+                    end_index = -1
+                    for i, t in enumerate(seq.pending_accepted_tokens):
+                        if (not seq.ignore_eos and t == self.eos) or (
+                            seq.num_completion_tokens
+                            - self.num_speculative_tokens
+                            + i
+                            + 1
+                            == seq.max_tokens
+                        ):
+                            end_index = i
+                            break
+
+                    if end_index != -1:
+                        to_pop = self.num_speculative_tokens - (end_index + 1)
+                        if to_pop > 0:
+                            seq.pop_last_n_tokens(to_pop)
+                        seq.pending_accepted_tokens.clear()
+                        seq.status = SequenceStatus.FINISHED
+                        self.block_manager.deallocate(seq)
+                        if seq in self.running:
+                            self.running.remove(seq)
+                        continue
+
+                if accepted_count < self.num_speculative_tokens:
+                    to_pop = self.num_speculative_tokens - accepted_count
+                    seq.pop_last_n_tokens(to_pop)
+
+                seq.pending_accepted_tokens.clear()
+                seq.append_token(token_id)
+
+                seq.num_cached_tokens = seq.num_cached_tokens + accepted_count + 1
+                seq.num_new_tokens = 0
+
+                # draft cache 语义：保持“当前最后一个 token 未处理”
+                seq.draft_num_cached_tokens = max(0, seq.num_cached_tokens - 1)
+                seq.is_speculative = False
+
+                if (
+                    (not seq.ignore_eos and token_id == self.eos)
+                    or seq.num_completion_tokens == seq.max_tokens
+                    or len(seq) >= self.max_model_len
+                ):
+                    if len(seq) >= self.max_model_len:
+                        print(
+                            f"Sequence {seq.seq_id} reached max_model_len {self.max_model_len}."
+                        )
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    if seq in self.running:
+                        self.running.remove(seq)
+                continue
+
             seq.append_token(token_id)
 
             if (
@@ -178,6 +243,6 @@ class Scheduler:
 
         # 更新所有未完成序列的缓存计数
         for seq in seqs:
-            if seq.status != SequenceStatus.FINISHED:
+            if seq.status != SequenceStatus.FINISHED and (not seq.is_speculative):
                 seq.num_cached_tokens = seq.num_cached_tokens + seq.num_new_tokens
                 seq.num_new_tokens = 0

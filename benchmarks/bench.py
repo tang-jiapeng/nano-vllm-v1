@@ -17,7 +17,7 @@ def main():
     max_input_len = 1024
     max_output_len = 1024
 
-    path = os.path.expanduser("~/nano-vllm/models/Qwen3-0.6B/")
+    path = os.path.expanduser("~/nano-vllm/models/Qwen3-1.7B/")
     # 支持命令行参数覆盖默认值
     import argparse
 

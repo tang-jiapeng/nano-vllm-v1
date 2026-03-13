@@ -54,7 +54,14 @@ class BlockManager:
     - chunked prefill（一次分配多个新块）
     """
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        num_draft_blocks: int = 0,
+        speculative_decoding: bool = False,
+        num_speculative_tokens: int = 0,
+    ):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
@@ -62,6 +69,12 @@ class BlockManager:
         self.used_block_ids: set[int] = set()
         # LRU 缓存：hash → block_id，最近使用的在末尾
         self.cached_blocks: OrderedDict[int, int] = OrderedDict()
+
+        self.speculative_decoding = speculative_decoding
+        self.num_speculative_tokens = num_speculative_tokens
+        self.draft_blocks: list[Block] = [Block(i) for i in range(num_draft_blocks)]
+        self.free_draft_block_ids: deque[int] = deque(range(num_draft_blocks))
+        self.used_draft_block_ids: set[int] = set()
 
     @property
     def num_free_blocks(self):
@@ -140,6 +153,23 @@ class BlockManager:
             # 无 hash（不完整块）：直接归还空闲池
             self.free_block_ids.append(block_id)
 
+    def _get_new_draft_block_id(self) -> int:
+        """获取一个 draft KV-cache 可用块 ID。"""
+        if not self.free_draft_block_ids:
+            return -1
+        block_id = self.free_draft_block_ids.popleft()
+        block = self.draft_blocks[block_id]
+        block.reset()
+        self.used_draft_block_ids.add(block_id)
+        return block_id
+
+    def _release_draft_block(self, block_id: int):
+        """释放 draft KV-cache 块。"""
+        block = self.draft_blocks[block_id]
+        assert block.ref_count == 0
+        self.used_draft_block_ids.discard(block_id)
+        self.free_draft_block_ids.append(block_id)
+
     # ── Waiting 队列操作 ──
 
     def get_token_layout(self, seq: Sequence):
@@ -187,10 +217,13 @@ class BlockManager:
 
     def can_allocate(self, num_tokens: int) -> bool:
         """检查可用块是否足够分配给定数量的新 token（waiting 队列用）。"""
-        return (
-            self.num_free_blocks
-            >= (num_tokens + self.block_size - 1) // self.block_size
-        )
+        needed = (num_tokens + self.block_size - 1) // self.block_size
+        if self.speculative_decoding:
+            return (
+                self.num_free_blocks >= needed
+                and len(self.free_draft_block_ids) >= needed
+            )
+        return self.num_free_blocks >= needed
 
     def allocate(self, seq: Sequence):
         """
@@ -257,6 +290,14 @@ class BlockManager:
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
 
+        if self.speculative_decoding:
+            required = len(seq.block_table)
+            while len(seq.draft_block_table) < required:
+                draft_block_id = self._get_new_draft_block_id()
+                assert draft_block_id != -1, "OOM: no free draft blocks available"
+                seq.draft_block_table.append(draft_block_id)
+            seq.draft_num_cached_tokens = seq.num_cached_tokens
+
     def deallocate(self, seq: Sequence):
         """释放序列所有块。块根据 hash 状态移入 LRU 缓存或空闲池。"""
         for block_id in reversed(seq.block_table):
@@ -267,6 +308,15 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.num_new_tokens = 0
         seq.block_table.clear()
+
+        if self.speculative_decoding:
+            for block_id in reversed(seq.draft_block_table):
+                block = self.draft_blocks[block_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._release_draft_block(block_id)
+            seq.draft_num_cached_tokens = 0
+            seq.draft_block_table.clear()
 
     # ── Running 队列操作 ──
 
@@ -285,6 +335,18 @@ class BlockManager:
             (num_new_tokens - last_block_capacity + self.block_size - 1)
             // self.block_size,
         )
+        if self.speculative_decoding:
+            target_tokens = (
+                seq.num_cached_tokens + num_new_tokens + self.num_speculative_tokens
+            )
+            target_blocks = (target_tokens + self.block_size - 1) // self.block_size
+            main_needed = max(0, target_blocks - len(seq.block_table))
+            draft_needed = max(0, target_blocks - len(seq.draft_block_table))
+            return (
+                self.num_free_blocks >= max(needed, main_needed)
+                and len(self.free_draft_block_ids) >= draft_needed
+            )
+
         return self.num_free_blocks >= needed
 
     def may_append(self, seq: Sequence):
@@ -326,3 +388,19 @@ class BlockManager:
                 block_id = self._get_new_block_id()
                 assert block_id != -1
                 seq.block_table.append(block_id)
+
+        if self.speculative_decoding:
+            target_tokens = (
+                seq.num_cached_tokens + seq.num_new_tokens + self.num_speculative_tokens
+            )
+            target_blocks = (target_tokens + self.block_size - 1) // self.block_size
+
+            while len(seq.block_table) < target_blocks:
+                block_id = self._get_new_block_id()
+                assert block_id != -1
+                seq.block_table.append(block_id)
+
+            while len(seq.draft_block_table) < target_blocks:
+                draft_block_id = self._get_new_draft_block_id()
+                assert draft_block_id != -1
+                seq.draft_block_table.append(draft_block_id)

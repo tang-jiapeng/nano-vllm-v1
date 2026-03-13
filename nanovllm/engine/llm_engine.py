@@ -115,7 +115,14 @@ class LLMEngine:
                 # 该序列本步获得了新 token
                 self.metrics.on_token_generated(seq.seq_id)
                 if seq.is_finished:
-                    finished_outputs.append((seq.seq_id, seq.completion_token_ids))
+                    finished_outputs.append(
+                        (
+                            seq.seq_id,
+                            seq.completion_token_ids,
+                            seq.num_speculative_proposed_total,
+                            seq.num_speculative_accepted_total,
+                        )
+                    )
                     self.metrics.on_request_finished(seq.seq_id)
                 else:
                     incremental_outputs.append((seq.seq_id, seq.last_token))
@@ -186,16 +193,25 @@ class LLMEngine:
                     }
                 )
 
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for seq_id, token_ids, proposed, accepted in output:
+                outputs[seq_id] = {
+                    "token_ids": token_ids,
+                    "proposed": proposed,
+                    "accepted": accepted,
+                }
                 if use_tqdm:
                     pbar.update(1)
 
         # 按 seq_id 排序并 decode
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [
-            {"text": self.tokenizer.decode(token_ids), "token_ids": token_ids}
-            for token_ids in outputs
+            {
+                "text": self.tokenizer.decode(item["token_ids"]),
+                "token_ids": item["token_ids"],
+                "proposed": item["proposed"],
+                "accepted": item["accepted"],
+            }
+            for item in outputs
         ]
 
         if use_tqdm:

@@ -194,6 +194,7 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 Qwen3-0.6B/
+Qwen3-1.7B/
 Qwen3-4B-AWQ/
 Qwen3-MOE-AWQ/
 Qwen3-VL-2B-Instruct/

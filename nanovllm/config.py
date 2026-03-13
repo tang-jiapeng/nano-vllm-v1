@@ -28,14 +28,23 @@ class Config:
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     chunked_prefill: bool = False
+    speculative_model: str | None = None
+    num_speculative_tokens: int = 0
     hf_config: AutoConfig | None = None
     awq_config: AWQConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    num_draft_kvcache_blocks: int = 0
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
+        if self.speculative_model is not None:
+            assert os.path.isdir(self.speculative_model)
+            assert self.num_speculative_tokens > 0
+            assert (
+                self.tensor_parallel_size == 1
+            ), "speculative decoding currently supports tensor_parallel_size=1 only"
         if HAS_FLASH_ATTN:
             assert (
                 self.kvcache_block_size % 256 == 0
@@ -48,6 +57,10 @@ class Config:
             logger.warning(
                 "flash-attn is not installed, using Triton attention kernel. "
                 "Install flash-attn for best performance: pip install flash-attn"
+            )
+            assert self.speculative_model is None, (
+                "speculative decoding currently requires flash-attn. "
+                "Please install flash-attn or disable speculative decoding."
             )
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)

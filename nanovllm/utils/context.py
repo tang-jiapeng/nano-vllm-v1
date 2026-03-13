@@ -20,6 +20,8 @@ class Context:
       - cu_seqlens_q is None     → 使用 decode attention（CUDA Graph 路径）
     """
 
+    is_speculative: bool = False
+    num_speculative_tokens: int = 0
     cu_seqlens_q: torch.Tensor | None = None
     cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0
@@ -52,10 +54,14 @@ def set_context(
     context_lens=None,
     block_tables=None,
     seq_need_compute_logits=None,
+    is_speculative=False,
+    num_speculative_tokens=0,
 ):
     """设置全局 Context，由 ModelRunner 在每次推理前调用。"""
     global _CONTEXT
     _CONTEXT = Context(
+        is_speculative,
+        num_speculative_tokens,
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q,
