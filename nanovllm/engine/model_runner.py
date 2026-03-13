@@ -423,14 +423,20 @@ class ModelRunner:
         """
         执行 target 模型前向推理。
 
-        纯 decode 且 batch ≤ 512 时使用 CUDA Graph 加速；
+        纯 decode 且序列数 ≤ 512 时使用 CUDA Graph 加速；
         其余情况（prefill、混合批次、大 batch）使用 eager 模式。
-        speculative verify 使用专用 verify CUDA Graph。
+        speculative verify 使用专用 verify CUDA Graph（以序列数而非总 token 数判断）。
         """
         context = get_context()
         is_prefill = context.is_prefill
+        # verify 阶段每个序列有 K+1 个 token，判断 CUDA Graph 可用性时应用序列数
+        # 而非总 token 数（否则 B=256, K=5 → 1536 tokens 会错误地跳过 CUDA Graph）。
+        if context.is_speculative:
+            effective_bs = input_ids.size(0) // (self.num_speculative_tokens + 1)
+        else:
+            effective_bs = input_ids.size(0)
         use_cuda_graph = (
-            not self.enforce_eager and not is_prefill and input_ids.size(0) <= 512
+            not self.enforce_eager and not is_prefill and effective_bs <= 512
         )
 
         if not use_cuda_graph:

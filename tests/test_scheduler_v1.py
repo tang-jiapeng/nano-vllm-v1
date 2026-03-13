@@ -452,7 +452,7 @@ def test_sched_speculative_draft_num_cached():
     )
 
     P = 3  # prompt 长度
-    C = P  # target 模型已缓存 P 个 prompt token
+    C = P  # target 模型已缓存 prompt_length 个 token
 
     def make_spec_seq(accepted_count):
         """构造 generate_draft_tokens 后的序列状态。"""
@@ -473,13 +473,13 @@ def test_sched_speculative_draft_num_cached():
         seq.status = SequenceStatus.RUNNING
         return seq
 
-    # ── 情形 1: a < K (3 out of 5 accepted) ──
-    a1 = 3
-    seq1 = make_spec_seq(a1)
+    # ── 情形 1: 部分接受 a < K (3 out of 5 accepted) ──
+    accepted_count_partial = 3
+    seq1 = make_spec_seq(accepted_count_partial)
     s.running.append(seq1)
     s.postprocess([seq1], [999], [0])
 
-    expected_cached1 = C + a1 + 1  # = 7
+    expected_cached1 = C + accepted_count_partial + 1  # = 7
     assert seq1.num_cached_tokens == expected_cached1, (
         f"a<K: expected num_cached={expected_cached1}, got {seq1.num_cached_tokens}"
     )
@@ -494,13 +494,13 @@ def test_sched_speculative_draft_num_cached():
         f"draft={seq1.draft_num_cached_tokens}, len-1={len(seq1)-1}"
     )
 
-    # ── 情形 2: a == K (all 5 accepted) ──
-    a2 = K
-    seq2 = make_spec_seq(a2)
+    # ── 情形 2: 全部接受 a == K (all 5 accepted) ──
+    accepted_count_full = K
+    seq2 = make_spec_seq(accepted_count_full)
     s.running.append(seq2)
     s.postprocess([seq2], [999], [0])
 
-    expected_cached2 = C + a2 + 1  # = C + K + 1
+    expected_cached2 = C + accepted_count_full + 1  # = C + K + 1
     expected_draft2 = C + K         # = num_cached - 1
     assert seq2.num_cached_tokens == expected_cached2, (
         f"a=K: expected num_cached={expected_cached2}, got {seq2.num_cached_tokens}"
