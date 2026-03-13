@@ -207,8 +207,17 @@ class Scheduler:
                 seq.num_cached_tokens = seq.num_cached_tokens + accepted_count + 1
                 seq.num_new_tokens = 0
 
-                # draft cache 语义：保持“当前最后一个 token 未处理”
-                seq.draft_num_cached_tokens = max(0, seq.num_cached_tokens - 1)
+                # draft cache 语义：有效缓存位置数取 generate_draft_tokens 写入量与
+                # 当前已确认 token 数之较小值。
+                # - accepted_count < K 时，draft 已写完全部 K 个位置，
+                #   其中接受的 accepted_count 个位置仍有效，
+                #   min(draft_num_cached, num_cached) = num_cached，
+                #   下一步无需 prefill，直接 CUDA Graph decode；
+                # - accepted_count == K 时，最后一个 draft token 仅被采样
+                #   未写入 KV cache，min 取较小值，下一步仍需 2-token prefill。
+                seq.draft_num_cached_tokens = min(
+                    seq.draft_num_cached_tokens, seq.num_cached_tokens
+                )
                 seq.is_speculative = False
 
                 if (

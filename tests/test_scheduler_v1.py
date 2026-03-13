@@ -11,6 +11,7 @@ vLLM v1 调度器单元测试（纯 CPU，无需 GPU）。
 7. 混合 prefill+decode 批次
 8. Preemption（抢占与恢复）
 9. Postprocess 终止条件
+10. Speculative decoding: draft_num_cached_tokens 正确更新
 """
 
 import importlib
@@ -57,6 +58,10 @@ class MockConfig:
         self.eos = kw.get("eos", 0)
         self.num_kvcache_blocks = kw.get("num_kvcache_blocks", 100)
         self.kvcache_block_size = kw.get("kvcache_block_size", BS)
+        # Speculative decoding fields (default: disabled)
+        self.speculative_model = kw.get("speculative_model", None)
+        self.num_speculative_tokens = kw.get("num_speculative_tokens", 0)
+        self.num_draft_kvcache_blocks = kw.get("num_draft_kvcache_blocks", 0)
 
 
 def make_scheduler(**kw):
@@ -424,8 +429,93 @@ def test_sched_ref_count_sharing():
 
 
 # ═══════════════════════════════════════════════
-# 运行所有测试
+# Speculative Decoding 测试
 # ═══════════════════════════════════════════════
+
+
+def test_sched_speculative_draft_num_cached():
+    """Speculative postprocess: draft_num_cached_tokens 正确更新。
+
+    验证修复前的 off-by-1 bug（原 max(0, num_cached-1)）已不存在：
+    - a < K 时，draft_num_cached 应等于 num_cached（下一步无需 prefill）
+    - a == K 时，draft_num_cached 应等于 num_cached-1（下一步需 2-token prefill）
+    """
+    setup()
+    K = 5
+    s = make_scheduler(
+        max_num_batched_tokens=256,
+        num_kvcache_blocks=50,
+        num_draft_kvcache_blocks=50,
+        speculative_model="dummy",
+        num_speculative_tokens=K,
+        eos=0,
+    )
+
+    P = 3  # prompt 长度
+    C = P  # target 模型已缓存 P 个 prompt token
+
+    def make_spec_seq(accepted_count):
+        """构造 generate_draft_tokens 后的序列状态。"""
+        # 创建 prompt 序列
+        seq = Sequence(
+            list(range(1, P + 1)),
+            SamplingParams(temperature=0.6, max_tokens=100, ignore_eos=True),
+        )
+        # 追加 bonus_prev 和 K 个 draft token，模拟 K 步 draft decode 后的状态
+        for i in range(K + 1):
+            seq.append_token(100 + i)  # 100=bonus_prev, 101..105=d0..d4
+        # 手动设置 generate_draft_tokens 结束后的状态
+        seq.num_cached_tokens = C
+        seq.draft_num_cached_tokens = C + K  # K 步 decode 后
+        seq.is_speculative = True
+        seq.pending_accepted_tokens = list(range(101, 101 + accepted_count))
+        seq.num_new_tokens = 0
+        seq.status = SequenceStatus.RUNNING
+        return seq
+
+    # ── 情形 1: a < K (3 out of 5 accepted) ──
+    a1 = 3
+    seq1 = make_spec_seq(a1)
+    s.running.append(seq1)
+    s.postprocess([seq1], [999], [0])
+
+    expected_cached1 = C + a1 + 1  # = 7
+    assert seq1.num_cached_tokens == expected_cached1, (
+        f"a<K: expected num_cached={expected_cached1}, got {seq1.num_cached_tokens}"
+    )
+    # draft_num_cached 应 = num_cached（min(C+K, C+a+1) = C+a+1）
+    assert seq1.draft_num_cached_tokens == expected_cached1, (
+        f"a<K: expected draft_num_cached={expected_cached1}, "
+        f"got {seq1.draft_num_cached_tokens}"
+    )
+    # 下一步 needs_prefill = (draft_num_cached < len-1) 应为 False
+    assert seq1.draft_num_cached_tokens == len(seq1) - 1, (
+        f"a<K: draft_num_cached should equal len-1 so next step skips prefill; "
+        f"draft={seq1.draft_num_cached_tokens}, len-1={len(seq1)-1}"
+    )
+
+    # ── 情形 2: a == K (all 5 accepted) ──
+    a2 = K
+    seq2 = make_spec_seq(a2)
+    s.running.append(seq2)
+    s.postprocess([seq2], [999], [0])
+
+    expected_cached2 = C + a2 + 1  # = C + K + 1
+    expected_draft2 = C + K         # = num_cached - 1
+    assert seq2.num_cached_tokens == expected_cached2, (
+        f"a=K: expected num_cached={expected_cached2}, got {seq2.num_cached_tokens}"
+    )
+    # draft_num_cached 应 = C+K（min(C+K, C+K+1) = C+K，因末尾 draft token 未写入 KV）
+    assert seq2.draft_num_cached_tokens == expected_draft2, (
+        f"a=K: expected draft_num_cached={expected_draft2}, "
+        f"got {seq2.draft_num_cached_tokens}"
+    )
+    # 下一步 needs_prefill 应为 True（需要补写未缓存的最后 draft token）
+    assert seq2.draft_num_cached_tokens < len(seq2) - 1, (
+        f"a=K: draft_num_cached should be less than len-1 so next step needs prefill"
+    )
+
+    print("  ✓ test_sched_speculative_draft_num_cached")
 
 if __name__ == "__main__":
     original_bs = Sequence.block_size
@@ -456,7 +546,13 @@ if __name__ == "__main__":
 
         print()
         print("=" * 50)
-        print("All 15 tests passed! ✅")
+        print("Speculative Decoding tests")
+        print("=" * 50)
+        test_sched_speculative_draft_num_cached()
+
+        print()
+        print("=" * 50)
+        print("All 16 tests passed! ✅")
         print("=" * 50)
     finally:
         Sequence.block_size = original_bs
