@@ -6,7 +6,7 @@ CPU KV offload 基准测试。
 2. 统计 swap_in / swap_out 次数、CPU/GPU KV block 使用率峰值。
 
 用法示例：
-  # 真实场景对比
+  # 
   python benchmarks/bench_cpu_offload.py --model ./models/Qwen3-0.6B --preset realistic
 
   # 极限 thrash 压测
@@ -235,10 +235,12 @@ def run_case(case: BenchmarkCase) -> dict:
         return {
             "latency_s": elapsed,
             "prompt_tokens": prompt_tokens,
+            "output_tokens": loop_stats["generated_tokens"],
             "generated_tokens": loop_stats["generated_tokens"],
             "total_tokens": total_tokens,
             "request_throughput_rps": case.num_seqs / max(elapsed, 1e-6),
             "token_throughput_tps": total_tokens / max(elapsed, 1e-6),
+            "throughput_tps": loop_stats["generated_tokens"] / max(elapsed, 1e-6),
             "gen_throughput_tps": loop_stats["generated_tokens"] / max(elapsed, 1e-6),
             **loop_stats,
         }
@@ -339,37 +341,39 @@ def build_realistic_cases(args) -> list[BenchmarkCase]:
     """
     - 不人为压小 GPU block
     - 使用较大的 CPU offload 空间
-    - 仅对比 offload 开 / 关
+    - 使用较大的 batched token budget，减少调度切分带来的额外偏差
+    - 使用 eager 模式
     """
     common = dict(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
-        max_num_batched_tokens=args.max_num_batched_tokens,
-        max_num_seqs=max(args.max_num_seqs, 512),
-        max_model_len=args.max_model_len,
-        chunked_prefill=args.chunked_prefill,
-        enforce_eager=args.enforce_eager,
+        max_num_batched_tokens=1024 * 256,
+        max_model_len=4096,
+        chunked_prefill=True,
+        enforce_eager=True,
         cpu_offload_gb=max(args.cpu_offload_gb, 60.0),
         cpu_offload_safety_margin_gb=args.cpu_offload_safety_margin_gb,
-        cpu_offload_watermark_blocks=args.cpu_offload_watermark_blocks,
+        cpu_offload_watermark_blocks=0,
         override_gpu_blocks=0,
         override_cpu_blocks=0,
-        warmup_iters=args.warmup_iters,
+        warmup_iters=2,
         seed=args.seed,
     )
     return [
         BenchmarkCase(
-            num_seqs=256,
+            num_seqs=384,
             input_len=256,
-            output_len=512,
+            output_len=640,
             offload=False,
+            max_num_seqs=384,
             **common,
         ),
         BenchmarkCase(
-            num_seqs=256,
+            num_seqs=384,
             input_len=256,
-            output_len=512,
+            output_len=640,
             offload=True,
+            max_num_seqs=384,
             **common,
         ),
         BenchmarkCase(
@@ -377,6 +381,7 @@ def build_realistic_cases(args) -> list[BenchmarkCase]:
             input_len=1024,
             output_len=2048,
             offload=False,
+            max_num_seqs=512,
             **common,
         ),
         BenchmarkCase(
@@ -384,6 +389,23 @@ def build_realistic_cases(args) -> list[BenchmarkCase]:
             input_len=1024,
             output_len=2048,
             offload=True,
+            max_num_seqs=512,
+            **common,
+        ),
+        BenchmarkCase(
+            num_seqs=64,
+            input_len=2048,
+            output_len=4096,
+            offload=False,
+            max_num_seqs=64,
+            **common,
+        ),
+        BenchmarkCase(
+            num_seqs=64,
+            input_len=2048,
+            output_len=4096,
+            offload=True,
+            max_num_seqs=64,
             **common,
         ),
     ]
@@ -450,7 +472,7 @@ def parse_args():
         "--preset",
         choices=["realistic", "stress"],
         default=None,
-        help="预设 benchmark 口径：realistic 做真实场景对比，stress 做极限压测。",
+        help="预设 benchmark 口径：realistic 做参考口径对比，stress 做极限压测。",
     )
     parser.add_argument("--tensor-parallel-size", "--tp", type=int, default=1)
     parser.add_argument("--num-seqs", type=int, default=256)
