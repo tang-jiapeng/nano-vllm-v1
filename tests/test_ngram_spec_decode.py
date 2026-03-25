@@ -46,6 +46,11 @@ class MockConfig:
         self.max_num_batched_tokens = kw.get("max_num_batched_tokens", 256)
         self.eos = kw.get("eos", 0)
         self.num_kvcache_blocks = kw.get("num_kvcache_blocks", 100)
+        self.enable_kv_offload = kw.get("enable_kv_offload", False)
+        self.num_cpu_kvcache_blocks = kw.get("num_cpu_kvcache_blocks", 0)
+        self.cpu_offload_watermark_blocks = kw.get(
+            "cpu_offload_watermark_blocks", 0
+        )
         self.kvcache_block_size = kw.get("kvcache_block_size", BS)
 
 

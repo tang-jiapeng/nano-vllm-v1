@@ -13,6 +13,14 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
+class CacheResidency(Enum):
+    """序列 KV 的驻留位置。"""
+
+    NONE = auto()
+    GPU = auto()
+    CPU = auto()
+
+
 class Sequence:
     """表示单个文本生成请求，贯穿整个推理生命周期，管理 token、状态及 KV-cache block 信息。"""
 
@@ -47,6 +55,8 @@ class Sequence:
 
         # KV-cache块表，记录该序列使用的所有块
         self.block_table = []
+        self.cpu_block_table = []
+        self.residency = CacheResidency.NONE
 
         # Speculative 解码状态
         self.is_speculative = False
@@ -142,7 +152,10 @@ class Sequence:
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.num_new_tokens,
+            self.status,
+            self.residency,
             self.block_table,
+            self.cpu_block_table,
             self.is_speculative,
             self.speculative_draft_tokens,
             self.pending_accepted_tokens,
@@ -162,7 +175,10 @@ class Sequence:
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.num_new_tokens,
+            self.status,
+            self.residency,
             self.block_table,
+            self.cpu_block_table,
             self.is_speculative,
             self.speculative_draft_tokens,
             self.pending_accepted_tokens,

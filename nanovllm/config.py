@@ -38,6 +38,11 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    enable_kv_offload: bool = False
+    cpu_offload_gb: float | str = 0.0
+    cpu_offload_safety_margin_gb: float = 4.0
+    cpu_offload_watermark_blocks: int = 0
+    num_cpu_kvcache_blocks: int = 0
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -58,6 +63,14 @@ class Config:
             )
             assert self.ngram_prompt_lookup_min >= 1
             assert self.ngram_prompt_lookup_max >= self.ngram_prompt_lookup_min
+        if self.enable_kv_offload:
+            assert self.cpu_offload_safety_margin_gb >= 0
+            assert self.cpu_offload_watermark_blocks >= 0
+            if self.speculative_method is not None:
+                raise ValueError(
+                    "CPU KV offload does not support speculative decoding yet. "
+                    "Please disable speculative decoding or KV offload."
+                )
         if HAS_FLASH_ATTN:
             assert (
                 self.kvcache_block_size % 256 == 0

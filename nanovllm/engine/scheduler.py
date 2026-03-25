@@ -1,23 +1,34 @@
 """
-vLLM v1 风格统一调度器，支持 chunked prefill。
+vLLM v1 风格统一调度器，支持 chunked prefill 与 CPU KV offload。
 
 核心设计：
-- 统一 running 队列（无独立 prefill/decode 阶段）
+- 统一 running / waiting 队列（无独立 prefill/decode 阶段）
 - 基于 token budget 的灵活调度（decode 优先，保证低延迟）
 - Chunked prefill：长 prompt 分块处理，与 decode 混合执行
 - 抢占机制：KV-cache 满时从 running 队列尾部抢占
+- CPU offload：被抢占的序列仍回到 waiting，通过 residency 优先恢复
 
 调度流程：
   1. Phase 1: 调度 running 队列（decode token + chunked prefill 续接）
-  2. Phase 2: 调度 waiting 队列（新请求的首个 chunk）
+  2. Phase 2: 调度 waiting 队列（offloaded 请求优先恢复，其次新请求）
      - 仅在 Phase 1 无抢占时执行
 """
 
 from collections import deque
+from dataclasses import dataclass, field
 
 from nanovllm.config import Config
 from nanovllm.engine.block_manager import BlockManager
-from nanovllm.engine.sequence import Sequence, SequenceStatus
+from nanovllm.engine.sequence import CacheResidency, Sequence, SequenceStatus
+
+
+@dataclass
+class SchedulerStep:
+    """单步调度结果，携带本轮执行序列与 swap 元数据。"""
+
+    seqs: list[Sequence] = field(default_factory=list)
+    swap_in_map: dict[int, int] = field(default_factory=dict)
+    swap_out_map: dict[int, int] = field(default_factory=dict)
 
 
 class Scheduler:
@@ -25,6 +36,7 @@ class Scheduler:
 
     def __init__(self, config: Config):
         self.enable_chunked = config.chunked_prefill
+        self.enable_kv_offload = config.enable_kv_offload
         speculative_method = getattr(config, "speculative_method", None)
         num_speculative_tokens = getattr(config, "num_speculative_tokens", 0)
         self.speculative_decoding = (
@@ -40,6 +52,8 @@ class Scheduler:
             config.kvcache_block_size,
             speculative_decoding=self.speculative_decoding,
             num_speculative_tokens=self.num_speculative_tokens,
+            num_cpu_blocks=config.num_cpu_kvcache_blocks,
+            cpu_offload_watermark_blocks=config.cpu_offload_watermark_blocks,
         )
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -55,50 +69,126 @@ class Scheduler:
         ), f"Sequence length {len(seq)} exceeds max_model_len {self.max_model_len}"
         self.waiting.append(seq)
 
-    def schedule(self) -> list[Sequence]:
+    def _pop_next_waiting(self) -> Sequence | None:
+        """优先选择 CPU-offloaded 的等待序列，其次选择普通 waiting 序列。"""
+        cpu_idx = next(
+            (
+                i
+                for i, seq in enumerate(self.waiting)
+                if seq.residency == CacheResidency.CPU
+            ),
+            None,
+        )
+        if cpu_idx is None:
+            return self.waiting.popleft() if self.waiting else None
+
+        self.waiting.rotate(-cpu_idx)
+        seq = self.waiting.popleft()
+        self.waiting.rotate(cpu_idx)
+        return seq
+
+    def _peek_next_offloaded_waiting(self) -> Sequence | None:
+        """查看 waiting 中下一个需要优先恢复的 CPU-offloaded 序列。"""
+        for seq in self.waiting:
+            if seq.residency == CacheResidency.CPU:
+                return seq
+        return None
+
+    def _compute_num_new_tokens(self, seq: Sequence, token_budget: int) -> int:
+        """计算序列本轮需处理的 token 数。"""
+        num_new_tokens = len(seq) - seq.num_cached_tokens
+        if self.enable_chunked:
+            num_new_tokens = min(num_new_tokens, token_budget)
+        num_new_tokens = min(
+            num_new_tokens, self.max_model_len - 1 - seq.num_cached_tokens
+        )
+        return num_new_tokens
+
+    def _preempt(self, seq: Sequence, step: SchedulerStep):
+        """抢占序列：优先 offload 到 CPU，否则回退为 recompute。"""
+        seq.status = SequenceStatus.WAITING
+        if self.enable_kv_offload and self.block_manager.can_swap_out(seq):
+            step.swap_out_map.update(self.block_manager.swap_out(seq))
+            self._append_waiting_offloaded(seq)
+        else:
+            self.block_manager.deallocate(seq)
+            self.waiting.appendleft(seq)
+
+    def _append_waiting_offloaded(self, seq: Sequence):
+        """将 CPU-offloaded 序列按 FIFO 顺序插入 waiting 的 offloaded 区域。"""
+        cpu_count = sum(1 for waiting_seq in self.waiting if waiting_seq.residency == CacheResidency.CPU)
+        self.waiting.rotate(-cpu_count)
+        self.waiting.appendleft(seq)
+        self.waiting.rotate(cpu_count)
+
+    def _ensure_resume_capacity(
+        self, step: SchedulerStep, token_budget: int
+    ) -> list[Sequence]:
+        """
+        为 waiting 中的 CPU-offloaded 序列主动腾出恢复空间。
+
+        设计思路与官方 swapped 请求优先的精神保持一致：
+        当系统中已经存在 offloaded 请求时，允许主动从 running 队尾抢占，
+        避免 waiting 中的 offloaded 请求长时间得不到恢复机会。
+        """
+        proactively_preempted = []
+        if not self.enable_kv_offload:
+            return proactively_preempted
+
+        while self.running:
+            seq = self._peek_next_offloaded_waiting()
+            if seq is None:
+                break
+
+            num_new_tokens = self._compute_num_new_tokens(seq, token_budget)
+            if num_new_tokens <= 0 or self.block_manager.can_swap_in(
+                seq, num_new_tokens
+            ):
+                break
+
+            preempted_seq = self.running.pop()
+            self._preempt(preempted_seq, step)
+            proactively_preempted.append(preempted_seq)
+
+        return proactively_preempted
+
+    def schedule(self) -> SchedulerStep:
         """
         执行一次统一调度决策。
 
-        返回设置了 num_new_tokens 的已调度序列列表。
-        在混合批次中，decode 序列（num_new_tokens=1）和
-        prefill 块（num_new_tokens>1）可以共存。
+        返回设置了 num_new_tokens 的已调度序列列表，以及本轮需要执行的
+        swap in / swap out 映射。
         """
+        step = SchedulerStep()
         scheduled_running_seqs = []
-        scheduled_new_reqs = []
+        scheduled_waiting_seqs = []
         preempted_seqs = []
         token_budget = self.max_num_batched_tokens
 
+        # 若 waiting 中已有 CPU-offloaded 请求，先主动为恢复请求腾挪 GPU 块。
+        preempted_seqs.extend(self._ensure_resume_capacity(step, token_budget))
+
         # ═══ Phase 1: 调度 running 队列 ═══
-        # running 中的序列可能是 decode（1 个新 token）或
-        # chunked prefill 的后续块（多个新 token）
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             seq = self.running[req_index]
-
-            # 计算本次需处理的 token 数
-            num_new_tokens = len(seq) - seq.num_cached_tokens
-            if self.enable_chunked:
-                num_new_tokens = min(num_new_tokens, token_budget)
-            num_new_tokens = min(
-                num_new_tokens, self.max_model_len - 1 - seq.num_cached_tokens
-            )
+            num_new_tokens = self._compute_num_new_tokens(seq, token_budget)
             assert num_new_tokens > 0
 
-            # 尝试分配块，不足时从尾部抢占
             while True:
                 if self.block_manager.can_append(seq, num_new_tokens):
                     seq.num_new_tokens = num_new_tokens
                     self.block_manager.may_append(seq)
                     break
-                # 抢占 running 队列尾部的序列
+
                 preempted_seq = self.running.pop()
-                self.preempt(preempted_seq)
+                self._preempt(preempted_seq, step)
                 preempted_seqs.append(preempted_seq)
                 if len(self.running) == req_index:
-                    break  # 无法再抢占（当前序列已是最后一个）
+                    break
 
             if len(self.running) == req_index:
-                break  # 当前序列被自身抢占
+                break
 
             scheduled_running_seqs.append(seq)
             token_budget -= seq.num_new_tokens
@@ -111,51 +201,57 @@ class Scheduler:
                 and token_budget > 0
                 and len(self.running) < self.max_num_seqs
             ):
-                seq = self.waiting[0]
-                assert not seq.block_table
-
-                # 分析 prefix cache 命中情况
-                num_computed_in_used, num_computed_in_cached, num_new_tokens = (
-                    self.block_manager.get_token_layout(seq)
-                )
-
-                if self.enable_chunked:
-                    num_new_tokens = min(num_new_tokens, token_budget)
-
-                assert num_new_tokens > 0
-
-                # 检查资源：token budget + block 可分配性
-                if (
-                    num_new_tokens > token_budget
-                    or not self.block_manager.can_allocate(
-                        num_computed_in_cached + num_new_tokens
-                    )
-                ):
+                seq = self._pop_next_waiting()
+                if seq is None:
                     break
 
-                # 调度该序列
-                seq.num_new_tokens = num_new_tokens
-                self.block_manager.allocate(seq)
-                assert (
-                    seq.num_cached_tokens
-                    == num_computed_in_used + num_computed_in_cached
-                )
+                num_new_tokens = self._compute_num_new_tokens(seq, token_budget)
+                assert num_new_tokens > 0
 
-                token_budget -= num_new_tokens
+                if seq.residency == CacheResidency.CPU:
+                    if not self.block_manager.can_swap_in(seq, num_new_tokens):
+                        self.waiting.appendleft(seq)
+                        break
+
+                    seq.num_new_tokens = num_new_tokens
+                    step.swap_in_map.update(self.block_manager.swap_in(seq))
+                    assert self.block_manager.can_append(seq, num_new_tokens), (
+                        "swap_in succeeded but append still failed; "
+                        "can_swap_in should reserve enough blocks."
+                    )
+                    self.block_manager.may_append(seq)
+                else:
+                    assert not seq.block_table
+                    num_computed_in_used, num_computed_in_cached, num_new_tokens = (
+                        self.block_manager.get_token_layout(seq)
+                    )
+                    if self.enable_chunked:
+                        num_new_tokens = min(num_new_tokens, token_budget)
+
+                    if (
+                        num_new_tokens <= 0
+                        or num_new_tokens > token_budget
+                        or not self.block_manager.can_allocate(
+                            num_computed_in_cached + num_new_tokens
+                        )
+                    ):
+                        self.waiting.appendleft(seq)
+                        break
+
+                    seq.num_new_tokens = num_new_tokens
+                    self.block_manager.allocate(seq)
+                    assert (
+                        seq.num_cached_tokens
+                        == num_computed_in_used + num_computed_in_cached
+                    )
+
+                token_budget -= seq.num_new_tokens
                 seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
                 self.running.append(seq)
-                scheduled_new_reqs.append(seq)
+                scheduled_waiting_seqs.append(seq)
 
-        scheduled_seqs = scheduled_running_seqs + scheduled_new_reqs
-        assert scheduled_seqs, "No sequences could be scheduled (possible OOM)"
-        return scheduled_seqs
-
-    def preempt(self, seq: Sequence):
-        """抢占序列：释放其 KV-cache 块，状态置为 WAITING 并插入 waiting 队列头部。"""
-        seq.status = SequenceStatus.WAITING
-        self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
+        step.seqs = scheduled_running_seqs + scheduled_waiting_seqs
+        return step
 
     def postprocess(
         self, seqs: list[Sequence], token_ids: list[int], seq_need_compute_logits
@@ -239,7 +335,6 @@ class Scheduler:
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
 
-        # 更新所有未完成序列的缓存计数
         for seq in seqs:
             if seq.status != SequenceStatus.FINISHED and (not seq.is_speculative):
                 seq.num_cached_tokens = seq.num_cached_tokens + seq.num_new_tokens

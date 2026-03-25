@@ -130,8 +130,9 @@ def bench_scheduler_metrics(model_path, num_prompts=30, max_tokens=64):
     while not llm.is_finished():
         t_start = time.time()
 
-        seqs = llm.scheduler.schedule()
-        if not seqs:
+        step = llm.scheduler.schedule()
+        seqs = step.seqs
+        if not seqs and not step.swap_in_map and not step.swap_out_map:
             continue
 
         t_sched = time.time()
@@ -140,10 +141,13 @@ def bench_scheduler_metrics(model_path, num_prompts=30, max_tokens=64):
         num_decode = sum(1 for s in seqs if s.num_new_tokens == 1)
         batch_size = len(seqs)
 
-        token_ids, seq_need = llm.model_runner.call("run", seqs)
+        token_ids, seq_need = llm.model_runner.call(
+            "run", seqs, step.swap_in_map, step.swap_out_map
+        )
         t_infer = time.time()
 
-        llm.scheduler.postprocess(seqs, token_ids, seq_need)
+        if seqs:
+            llm.scheduler.postprocess(seqs, token_ids, seq_need)
         t_post = time.time()
 
         step_metrics.append(

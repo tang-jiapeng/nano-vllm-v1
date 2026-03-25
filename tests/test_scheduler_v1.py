@@ -5,12 +5,14 @@ vLLM v1 调度器单元测试（纯 CPU，无需 GPU）。
 1. BlockManager 基本分配/释放
 2. BlockManager prefix caching + LRU eviction
 3. BlockManager chunked prefill 支持
-4. Scheduler 统一调度（running 优先 + waiting）
-5. Token budget 约束
-6. Chunked prefill 分块调度
-7. 混合 prefill+decode 批次
-8. Preemption（抢占与恢复）
-9. Postprocess 终止条件
+4. BlockManager CPU offload swap_out/swap_in
+5. Scheduler 统一调度（running 优先 + waiting）
+6. Token budget 约束
+7. Chunked prefill 分块调度
+8. 混合 prefill+decode 批次
+9. Preemption（抢占与恢复）
+10. CPU offload preempt/resume
+11. Postprocess 终止条件
 """
 
 import importlib
@@ -26,6 +28,7 @@ _sp = importlib.import_module("nanovllm.sampling_params")
 
 Sequence = _seq.Sequence
 SequenceStatus = _seq.SequenceStatus
+CacheResidency = _seq.CacheResidency
 Block = _bm.Block
 BlockManager = _bm.BlockManager
 SamplingParams = _sp.SamplingParams
@@ -56,6 +59,13 @@ class MockConfig:
         self.max_num_batched_tokens = kw.get("max_num_batched_tokens", 256)
         self.eos = kw.get("eos", 0)
         self.num_kvcache_blocks = kw.get("num_kvcache_blocks", 100)
+        self.enable_kv_offload = kw.get("enable_kv_offload", False)
+        self.num_cpu_kvcache_blocks = kw.get("num_cpu_kvcache_blocks", 0)
+        self.cpu_offload_watermark_blocks = kw.get(
+            "cpu_offload_watermark_blocks", 0
+        )
+        self.speculative_method = kw.get("speculative_method", None)
+        self.num_speculative_tokens = kw.get("num_speculative_tokens", 0)
         self.kvcache_block_size = kw.get("kvcache_block_size", BS)
 
 
@@ -200,6 +210,59 @@ def test_bm_chunked_append():
     print("  ✓ test_bm_chunked_append")
 
 
+def test_bm_swap_out_in():
+    """CPU offload: swap_out / swap_in 基本路径。"""
+    setup()
+    bm = BlockManager(num_blocks=10, block_size=BS, num_cpu_blocks=10)
+
+    seq = Sequence([1, 2, 3, 4, 5, 6], sp())
+    seq.num_new_tokens = 6
+    bm.allocate(seq)
+    seq.num_cached_tokens = 6
+    seq.num_new_tokens = 0
+
+    mapping_out = bm.swap_out(seq)
+    assert seq.residency == CacheResidency.CPU
+    assert seq.block_table == []
+    assert len(seq.cpu_block_table) == 2
+    assert len(mapping_out) == 2
+
+    mapping_in = bm.swap_in(seq)
+    assert seq.residency == CacheResidency.GPU
+    assert seq.cpu_block_table == []
+    assert len(seq.block_table) == 2
+    assert len(mapping_in) == 2
+
+    bm.deallocate(seq)
+    print("  ✓ test_bm_swap_out_in")
+
+
+def test_bm_swap_in_reuses_gpu_block():
+    """CPU offload: swap_in 时可复用 GPU 上仍存在的完整块。"""
+    setup()
+    bm = BlockManager(num_blocks=10, block_size=BS, num_cpu_blocks=10)
+
+    seq1 = Sequence([1, 2, 3, 4, 9, 10], sp())
+    seq1.num_new_tokens = 6
+    bm.allocate(seq1)
+    seq1.num_cached_tokens = 6
+    seq1.num_new_tokens = 0
+    bm.swap_out(seq1)
+
+    seq2 = Sequence([1, 2, 3, 4, 20, 21], sp())
+    seq2.num_new_tokens = 6
+    bm.allocate(seq2)
+    seq2.num_cached_tokens = 6
+    seq2.num_new_tokens = 0
+
+    mapping_in = bm.swap_in(seq1)
+    assert len(mapping_in) == 1, f"Expected only partial block to copy, got {mapping_in}"
+
+    bm.deallocate(seq1)
+    bm.deallocate(seq2)
+    print("  ✓ test_bm_swap_in_reuses_gpu_block")
+
+
 # ═══════════════════════════════════════════════
 # Scheduler 测试
 # ═══════════════════════════════════════════════
@@ -215,7 +278,7 @@ def test_sched_basic():
     s.add(seq1)
     s.add(seq2)
 
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
     assert len(seqs) == 2
     assert seq1.status == SequenceStatus.RUNNING
     assert seq1.num_new_tokens == 3
@@ -233,7 +296,7 @@ def test_sched_token_budget():
     s.add(seq1)
     s.add(seq2)
 
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
     assert len(seqs) == 1
     assert seqs[0] is seq1
     assert len(s.waiting) == 1
@@ -247,7 +310,7 @@ def test_sched_decode_priority():
 
     seq1 = Sequence([1, 2, 3], sp(max_tokens=10))
     s.add(seq1)
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
 
     # 模拟一步
     seq1.append_token(10)
@@ -257,7 +320,7 @@ def test_sched_decode_priority():
     seq2 = Sequence([4, 5, 6, 7], sp(max_tokens=5))
     s.add(seq2)
 
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
     assert len(seqs) == 2
     assert seqs[0] is seq1  # running 优先
     assert seqs[1] is seq2
@@ -277,7 +340,7 @@ def test_sched_chunked_prefill():
     s.add(seq)
 
     # 第一个 chunk
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
     assert len(seqs) == 1
     assert seqs[0].num_new_tokens == 8
 
@@ -285,7 +348,7 @@ def test_sched_chunked_prefill():
     seq.num_new_tokens = 0
 
     # 第二个 chunk
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
     assert len(seqs) == 1
     assert seqs[0].num_new_tokens == 8
     print("  ✓ test_sched_chunked_prefill")
@@ -300,7 +363,7 @@ def test_sched_chunked_mixed():
 
     short = Sequence([1, 2, 3], sp(max_tokens=10))
     s.add(short)
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
 
     short.append_token(10)
     short.num_cached_tokens += short.num_new_tokens
@@ -309,7 +372,7 @@ def test_sched_chunked_mixed():
     long = Sequence(list(range(20)), sp(max_tokens=5))
     s.add(long)
 
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
     assert len(seqs) == 2
     assert short.num_new_tokens == 1  # decode
     assert long.num_new_tokens <= 15  # budget - 1
@@ -328,10 +391,85 @@ def test_sched_preemption():
     s.add(seq1)
     s.add(seq2)
 
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
     assert len(seqs) >= 1
     assert len(s.running) >= 1
     print("  ✓ test_sched_preemption")
+
+
+def test_sched_offload_preempt_and_resume():
+    """CPU offload: 抢占时换出，后续优先恢复 waiting 中的 offloaded 序列。"""
+    setup()
+    s = make_scheduler(
+        max_num_batched_tokens=64,
+        num_kvcache_blocks=3,
+        num_cpu_kvcache_blocks=8,
+        enable_kv_offload=True,
+        kvcache_block_size=BS,
+    )
+
+    seq1 = Sequence([1, 2, 3, 4], sp(max_tokens=10))
+    seq2 = Sequence([5, 6, 7, 8], sp(max_tokens=10))
+    s.add(seq1)
+    s.add(seq2)
+
+    step = s.schedule()
+    assert len(step.seqs) == 2
+
+    for seq, token_id in zip(step.seqs, [11, 12]):
+        seq.append_token(token_id)
+        seq.num_cached_tokens += seq.num_new_tokens
+        seq.num_new_tokens = 0
+
+    step = s.schedule()
+    assert step.swap_out_map
+    assert seq2 in s.waiting
+    assert seq2.residency == CacheResidency.CPU
+
+    s.running.remove(seq1)
+    s.block_manager.deallocate(seq1)
+    seq1.status = SequenceStatus.FINISHED
+
+    step = s.schedule()
+    assert seq2 in step.seqs
+    assert step.swap_in_map
+    assert seq2.residency == CacheResidency.GPU
+    print("  ✓ test_sched_offload_preempt_and_resume")
+
+
+def test_sched_offload_proactive_resume():
+    """CPU offload: waiting 中有 offloaded 请求时，主动抢占为恢复腾空间。"""
+    setup()
+    s = make_scheduler(
+        max_num_batched_tokens=64,
+        num_kvcache_blocks=4,
+        num_cpu_kvcache_blocks=8,
+        enable_kv_offload=True,
+        kvcache_block_size=BS,
+    )
+
+    seqs = [Sequence([i, i + 1, i + 2], sp(max_tokens=10)) for i in range(4)]
+    for seq in seqs:
+        s.add(seq)
+
+    step = s.schedule()
+    assert len(step.seqs) == 4
+    s.postprocess(step.seqs, [10, 11, 12, 13], [0, 1, 2, 3])
+
+    step = s.schedule()
+    assert len(step.seqs) == 4
+    s.postprocess(step.seqs, [20, 21, 22, 23], [0, 1, 2, 3])
+
+    step = s.schedule()
+    assert step.swap_out_map
+    assert sum(seq.residency == CacheResidency.CPU for seq in s.waiting) >= 1
+
+    step = s.schedule()
+    assert step.swap_out_map or step.swap_in_map
+
+    step = s.schedule()
+    assert step.swap_in_map, "Expected proactive preemption to make room for swap-in"
+    print("  ✓ test_sched_offload_proactive_resume")
 
 
 def test_sched_postprocess_eos():
@@ -341,7 +479,7 @@ def test_sched_postprocess_eos():
 
     seq = Sequence([1, 2, 3], sp(max_tokens=100))
     s.add(seq)
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
 
     s.postprocess(seqs, [0], [0])  # EOS
     assert seq.status == SequenceStatus.FINISHED
@@ -356,13 +494,13 @@ def test_sched_postprocess_max_tokens():
 
     seq = Sequence([1, 2, 3], sp(max_tokens=2))
     s.add(seq)
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
 
     # token 1
     s.postprocess(seqs, [10], [0])
     assert seq.status != SequenceStatus.FINISHED
 
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
     # token 2
     s.postprocess(seqs, [11], [0])
     assert seq.status == SequenceStatus.FINISHED
@@ -381,7 +519,7 @@ def test_sched_is_finished():
     s.add(seq)
     assert not s.is_finished()
 
-    seqs = s.schedule()
+    seqs = s.schedule().seqs
     assert not s.is_finished()
 
     s.postprocess(seqs, [10], [0])
@@ -438,6 +576,8 @@ if __name__ == "__main__":
         test_bm_lru_eviction()
         test_bm_can_append()
         test_bm_chunked_append()
+        test_bm_swap_out_in()
+        test_bm_swap_in_reuses_gpu_block()
 
         print()
         print("=" * 50)
@@ -449,6 +589,8 @@ if __name__ == "__main__":
         test_sched_chunked_prefill()
         test_sched_chunked_mixed()
         test_sched_preemption()
+        test_sched_offload_preempt_and_resume()
+        test_sched_offload_proactive_resume()
         test_sched_postprocess_eos()
         test_sched_postprocess_max_tokens()
         test_sched_is_finished()
@@ -456,7 +598,7 @@ if __name__ == "__main__":
 
         print()
         print("=" * 50)
-        print("All 15 tests passed! ✅")
+        print("All 19 tests passed! ✅")
         print("=" * 50)
     finally:
         Sequence.block_size = original_bs

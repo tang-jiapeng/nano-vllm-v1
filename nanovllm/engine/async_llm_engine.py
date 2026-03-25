@@ -157,7 +157,7 @@ class AsyncLLMEngine:
                 self._push_to_queue(req.output_queue, output)
 
             # ── 5. 处理完成的序列 ──
-            for seq_id, completion_token_ids in finished_outputs:
+            for seq_id, completion_token_ids, _proposed, _accepted in finished_outputs:
                 request_id = self._seq_to_request.pop(seq_id, None)
                 if request_id is None:
                     continue

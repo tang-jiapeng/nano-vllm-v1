@@ -39,6 +39,7 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        self.enable_kv_offload = config.enable_kv_offload
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -76,6 +77,9 @@ class ModelRunner:
                 max_ngram=config.ngram_prompt_lookup_max,
             )
         self.sampler = Sampler()
+        if self.enable_kv_offload:
+            self.swap_stream = torch.cuda.Stream(device=rank)
+            self.swap_event = torch.cuda.Event()
 
         # 3. Warmup
         self.warmup_model()
@@ -118,8 +122,10 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         # 显式释放 KV cache 和模型权重占用的 GPU 显存
-        if hasattr(self, "kv_cache"):
-            del self.kv_cache
+        if hasattr(self, "gpu_kv_cache"):
+            del self.gpu_kv_cache
+        if hasattr(self, "cpu_kv_cache"):
+            del self.cpu_kv_cache
         if hasattr(self, "model"):
             del self.model
         torch.cuda.synchronize()
@@ -207,7 +213,7 @@ class ModelRunner:
         )
         assert config.num_kvcache_blocks > 0
 
-        self.kv_cache = torch.empty(
+        self.gpu_kv_cache = torch.empty(
             2,
             hf_config.num_hidden_layers,
             config.num_kvcache_blocks,
@@ -219,9 +225,89 @@ class ModelRunner:
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
+                module.k_cache = self.gpu_kv_cache[0, layer_id]
+                module.v_cache = self.gpu_kv_cache[1, layer_id]
                 layer_id += 1
+
+        if self.enable_kv_offload:
+            cpu_offload_gb = config.cpu_offload_gb
+            if isinstance(cpu_offload_gb, str):
+                if cpu_offload_gb != "auto":
+                    raise ValueError(
+                        "cpu_offload_gb must be a non-negative float or 'auto'"
+                    )
+                try:
+                    import psutil
+                except ImportError as exc:
+                    raise ImportError(
+                        "CPU KV offload requires psutil when cpu_offload_gb='auto'."
+                    ) from exc
+                available_gb = psutil.virtual_memory().available / (1024**3)
+                allocated_cpu_gb = available_gb - config.cpu_offload_safety_margin_gb
+                if allocated_cpu_gb <= 0:
+                    raise RuntimeError(
+                        "Not enough CPU memory for KV offload after reserving "
+                        f"{config.cpu_offload_safety_margin_gb:.2f} GB safety margin."
+                    )
+            else:
+                allocated_cpu_gb = float(cpu_offload_gb)
+                if allocated_cpu_gb <= 0:
+                    raise ValueError(
+                        "CPU KV offload is enabled but cpu_offload_gb is not positive."
+                    )
+
+            config.num_cpu_kvcache_blocks = int((allocated_cpu_gb * 1024**3) // block_bytes)
+            assert config.num_cpu_kvcache_blocks > 0, (
+                "Not enough CPU memory to hold at least one KV cache block."
+            )
+            self.cpu_kv_cache = torch.empty(
+                2,
+                hf_config.num_hidden_layers,
+                config.num_cpu_kvcache_blocks,
+                self.block_size,
+                num_kv_heads,
+                head_dim,
+                device="cpu",
+                pin_memory=True,
+            )
+        else:
+            config.num_cpu_kvcache_blocks = 0
+            self.cpu_kv_cache = None
+
+    def execute_swap(
+        self,
+        swap_in_map: dict[int, int] | None = None,
+        swap_out_map: dict[int, int] | None = None,
+    ) -> bool:
+        """
+        执行 GPU <-> CPU KV block 迁移。
+
+        Args:
+            swap_in_map: {cpu_block_id: gpu_block_id}
+            swap_out_map: {gpu_block_id: cpu_block_id}
+
+        Returns:
+            是否实际提交了异步 copy。
+        """
+        if not self.enable_kv_offload:
+            return False
+
+        swap_in_map = swap_in_map or {}
+        swap_out_map = swap_out_map or {}
+        if not swap_in_map and not swap_out_map:
+            return False
+
+        with torch.cuda.stream(self.swap_stream):
+            for gpu_block_id, cpu_block_id in swap_out_map.items():
+                self.cpu_kv_cache[:, :, cpu_block_id].copy_(
+                    self.gpu_kv_cache[:, :, gpu_block_id], non_blocking=True
+                )
+            for cpu_block_id, gpu_block_id in swap_in_map.items():
+                self.gpu_kv_cache[:, :, gpu_block_id].copy_(
+                    self.cpu_kv_cache[:, :, cpu_block_id], non_blocking=True
+                )
+        self.swap_event.record(self.swap_stream)
+        return True
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         """构建 [num_seqs, max_num_blocks] 的 block table tensor。"""
@@ -558,11 +644,22 @@ class ModelRunner:
 
         return token_ids
 
-    def run(self, seqs: list[Sequence]):
+    def run(
+        self,
+        seqs: list[Sequence],
+        swap_in_map: dict[int, int] | None = None,
+        swap_out_map: dict[int, int] | None = None,
+    ):
         """
         完整推理流程：数据准备 -> 前向计算 -> 采样 -> 清理。
         返回 (token_ids, seq_need_compute_logits)。
         """
+        has_swaps = self.execute_swap(swap_in_map, swap_out_map)
+        if not seqs:
+            if has_swaps:
+                self.swap_event.wait(torch.cuda.current_stream())
+            return [], []
+
         is_pure_decode = all(seq.num_new_tokens == 1 for seq in seqs) and all(
             seq.block_table for seq in seqs
         )
@@ -574,6 +671,8 @@ class ModelRunner:
             return token_ids, seq_need_compute_logits
 
         input_ids, positions = self.prepare_model_input(seqs)
+        if has_swaps:
+            self.swap_event.wait(torch.cuda.current_stream())
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions)
         token_ids = (

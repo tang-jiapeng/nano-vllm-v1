@@ -30,6 +30,10 @@ def main():
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--chunked-prefill", action="store_true")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--enable-kv-offload", action="store_true")
+    parser.add_argument("--cpu-offload-gb", type=str, default="0")
+    parser.add_argument("--cpu-offload-safety-margin-gb", type=float, default=4.0)
+    parser.add_argument("--cpu-offload-watermark-blocks", type=int, default=0)
     parser.add_argument("--speculative-method", choices=["ngram"], default=None)
     parser.add_argument("--num-speculative-tokens", type=int, default=0)
     parser.add_argument("--ngram-prompt-lookup-min", type=int, default=1)
@@ -45,6 +49,14 @@ def main():
         enforce_eager=args.enforce_eager,
         chunked_prefill=args.chunked_prefill,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        enable_kv_offload=args.enable_kv_offload,
+        cpu_offload_gb=(
+            "auto"
+            if args.cpu_offload_gb == "auto"
+            else float(args.cpu_offload_gb)
+        ),
+        cpu_offload_safety_margin_gb=args.cpu_offload_safety_margin_gb,
+        cpu_offload_watermark_blocks=args.cpu_offload_watermark_blocks,
         speculative_method=args.speculative_method,
         num_speculative_tokens=args.num_speculative_tokens,
         ngram_prompt_lookup_min=args.ngram_prompt_lookup_min,

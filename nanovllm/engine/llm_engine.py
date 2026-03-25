@@ -95,15 +95,21 @@ class LLMEngine:
         - num_prefill_tokens: 本次 prefill 处理的 token 数
         - num_decode_tokens: 本次 decode 处理的序列数
         """
-        seqs = self.scheduler.schedule()
-        if not seqs:
+        step = self.scheduler.schedule()
+        if not step.seqs and not step.swap_in_map and not step.swap_out_map:
             return [], [], 0, 0
 
         # 在模型推理前计算指标（postprocess 会重置 num_new_tokens）
+        seqs = step.seqs
         num_prefill_tokens = sum(s.num_new_tokens for s in seqs if s.num_new_tokens > 1)
         num_decode_tokens = sum(1 for s in seqs if s.num_new_tokens == 1)
 
-        token_ids, seq_need_compute_logits = self.model_runner.call("run", seqs)
+        token_ids, seq_need_compute_logits = self.model_runner.call(
+            "run", seqs, step.swap_in_map, step.swap_out_map
+        )
+        if not seqs:
+            return [], [], 0, 0
+
         # 记录本步获得新 token 的序列索引
         new_token_indices = set(seq_need_compute_logits)
         self.scheduler.postprocess(seqs, token_ids, seq_need_compute_logits)
