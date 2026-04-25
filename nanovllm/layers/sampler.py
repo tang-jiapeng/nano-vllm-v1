@@ -12,15 +12,22 @@ class Sampler(nn.Module):
 
     @torch.compile
     def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
-        """对logits进行温度缩放后，通过Gumbel-Max技巧采样token。"""
-        # 温度缩放
-        logits = logits.float().div_(temperatures.unsqueeze(dim=1))
+        """对logits进行采样。temperature=0时走greedy，其余走Gumbel-Max。"""
+        logits = logits.float()
 
-        probs = torch.softmax(logits, dim=-1)
+        greedy_mask = temperatures <= 1e-10
+        greedy_tokens = logits.argmax(dim=-1)
 
-        # Gumbel-Max采样：probs / exponential(1) 等价于添加Gumbel噪声
-        sample_tokens = probs.div_(
+        safe_temperatures = torch.where(
+            greedy_mask,
+            torch.ones_like(temperatures),
+            temperatures,
+        )
+        scaled_logits = logits.div(safe_temperatures.unsqueeze(dim=1))
+        probs = torch.softmax(scaled_logits, dim=-1)
+
+        sample_tokens = probs.div(
             torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)
         ).argmax(dim=-1)
 
-        return sample_tokens
+        return torch.where(greedy_mask, greedy_tokens, sample_tokens)

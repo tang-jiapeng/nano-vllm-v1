@@ -1,99 +1,23 @@
 """
-基于Flash Attention的多头注意力层，集成KV-cache管理、prefix caching和Triton优化的cache写入。
-当 flash-attn 未安装时，自动回退到 Triton 自实现 kernel。
+基于Flash Attention的多头注意力层，集成KV-cache管理和prefix caching。
 """
 
 import logging
 
 import torch
-import triton
-import triton.language as tl
 from torch import nn
 
-from nanovllm.kernels.attention import (
-    flash_atten_prefill,
-    flash_atten_prefill_paged,
-    paged_attention_decode,
-)
+from nanovllm.kernels.kv_cache import store_kvcache
 from nanovllm.utils.context import get_context
 
-try:
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-
-    HAS_FLASH_ATTN = True
-except ImportError:
-    HAS_FLASH_ATTN = False
+from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 logger = logging.getLogger(__name__)
-
-
-@triton.jit
-def store_kvcache_kernel(
-    key_ptr,
-    key_stride,
-    value_ptr,
-    value_stride,
-    k_cache_ptr,
-    v_cache_ptr,
-    slot_mapping_ptr,
-    D: tl.constexpr,
-):
-    """Triton内核：按slot_mapping将K/V并行写入KV-cache。"""
-    idx = tl.program_id(0)
-    slot = tl.load(slot_mapping_ptr + idx)
-
-    if slot == -1:
-        return
-
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-
-    cache_offsets = slot * D + tl.arange(0, D)
-
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
-
-
-def store_kvcache(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-):
-    """调用Triton内核将K/V写入KV-cache，写入前验证tensor内存布局。"""
-    N, num_heads, head_dim = key.shape
-    D = num_heads * head_dim
-
-    assert key.stride(-1) == 1 and value.stride(-1) == 1
-    assert key.stride(1) == head_dim and value.stride(1) == head_dim
-    assert k_cache.stride(1) == D and v_cache.stride(1) == D
-    assert slot_mapping.numel() == N
-
-    store_kvcache_kernel[(N,)](
-        key,
-        key.stride(0),
-        value,
-        value.stride(0),
-        k_cache,
-        v_cache,
-        slot_mapping,
-        D,
-    )
 
 
 class Attention(nn.Module):
     """
     多头注意力层，自动切换 prefill/decode 模式，集成 KV-cache 存储。
-
-    后端选择策略:
-        - flash-attn 可用时: 使用 flash_attn_varlen_func / flash_attn_with_kvcache
-        - flash-attn 不可用时: 回退到 Triton 自实现 flash_atten_prefill /
-          flash_atten_prefill_paged / paged_attention_decode
-        两种后端均支持 prefix caching。
     """
 
     def __init__(
@@ -151,52 +75,6 @@ class Attention(nn.Module):
                 causal=True,
             )
 
-    def _forward_triton(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        context,
-    ) -> torch.Tensor:
-        """使用 Triton 自实现 kernel 执行 attention（支持 prefix caching）。"""
-        k_cache, v_cache = self.k_cache, self.v_cache
-
-        if context.is_prefill:
-            if context.block_tables is not None:
-                # Prefix caching: Q 仅含新增 token，K/V 从 paged cache 读取
-                return flash_atten_prefill_paged(
-                    q,
-                    k_cache,
-                    v_cache,
-                    block_tables=context.block_tables,
-                    cu_seqlens_q=context.cu_seqlens_q,
-                    cu_seqlens_k=context.cu_seqlens_k,
-                    scale=self.scale,
-                    num_heads=self.num_heads,
-                    num_kv_heads=self.num_kv_heads,
-                    head_dim=self.head_dim,
-                )
-            else:
-                return flash_atten_prefill(
-                    q,
-                    k,
-                    v,
-                    cu_seqlens=context.cu_seqlens_q,
-                    scale=self.scale,
-                    num_heads=self.num_heads,
-                    num_kv_heads=self.num_kv_heads,
-                    head_dim=self.head_dim,
-                )
-        else:
-            return paged_attention_decode(
-                q,
-                k_cache,
-                v_cache,
-                block_tables=context.block_tables,
-                context_lens=context.context_lens,
-                scale=self.scale,
-            )
-
     def forward(
         self,
         q: torch.Tensor,
@@ -210,9 +88,4 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
-        if HAS_FLASH_ATTN:
-            o = self._forward_flash_attn(q, k, v, context)
-        else:
-            o = self._forward_triton(q, k, v, context)
-
-        return o
+        return self._forward_flash_attn(q, k, v, context)

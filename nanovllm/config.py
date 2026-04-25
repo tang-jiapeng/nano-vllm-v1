@@ -36,19 +36,13 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        if HAS_FLASH_ATTN:
-            assert (
-                self.kvcache_block_size % 256 == 0
-            ), "flash-attn requires kvcache_block_size to be a multiple of 256"
-        else:
-            assert (
-                self.kvcache_block_size >= 16
-                and (self.kvcache_block_size & (self.kvcache_block_size - 1)) == 0
-            ), "kvcache_block_size must be a power of 2 and >= 16"
-            logger.warning(
-                "flash-attn is not installed, using Triton attention kernel. "
-                "Install flash-attn for best performance: pip install flash-attn"
+        if not HAS_FLASH_ATTN:
+            raise ImportError(
+                "flash-attn is required. Install it before running nano-vllm."
             )
+        assert (
+            self.kvcache_block_size % 256 == 0
+        ), "flash-attn requires kvcache_block_size to be a multiple of 256"
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(

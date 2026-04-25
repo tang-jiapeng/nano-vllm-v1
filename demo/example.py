@@ -49,7 +49,7 @@ def main(args):
             [{"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=True,
+            enable_thinking=args.enable_thinking,
         )
         for prompt in prompts
     ]
@@ -82,7 +82,8 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
     )
-    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--enable-thinking", action="store_true", default=False)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=256)
     args = parser.parse_args()
 

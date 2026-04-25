@@ -10,12 +10,10 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
-from nanovllm.layers.quantization.fused_moe import (
-    AWQFusedMoEMethod,
-    UnquantizedFusedMoEMethod,
-)
+from nanovllm.layers.moe.fused import FusedMoe
 from nanovllm.layers.rotary_embedding import get_rope
 
 
@@ -147,30 +145,32 @@ class Qwen3MoeMLP(nn.Module):
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
-    """Qwen3-MoE sparse block with stacked expert weights and fused MoE."""
+    """Qwen3-MoE sparse block using a Mini-SGLang-style fused MoE backend."""
 
     def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        self.tp_size = dist.get_world_size()
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+        )
+        self.moe = FusedMoe()
 
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-
-        awq_config = getattr(config, "_awq_config", None)
-        if awq_config is None:
-            self.moe_method = UnquantizedFusedMoEMethod()
-        else:
-            self.moe_method = AWQFusedMoEMethod(awq_config)
-
-        self.moe_method.create_weights(
+        self.moe.create_weights(
             self, config.num_experts, config.hidden_size, config.moe_intermediate_size
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits = self.gate(hidden_states)
-        return self.moe_method.apply(
+        output = self.moe.forward(
             self, hidden_states, router_logits, self.top_k, self.norm_topk_prob
         )
+        if self.tp_size > 1:
+            dist.all_reduce(output)
+        return output
 
 
 class Qwen3MoeDecoderLayer(nn.Module):

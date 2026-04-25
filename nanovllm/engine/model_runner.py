@@ -52,6 +52,11 @@ class ModelRunner:
                 f"不支持的模型类型: {model_type!r}。"
                 f"当前支持: {list(model_dict.keys())}"
             )
+        if model_type == "qwen3_moe" and config.awq_config is not None:
+            raise NotImplementedError(
+                "Qwen3 MoE does not support AWQ quantization. "
+                "Please use an unquantized/fp16 MoE model."
+            )
         model_cls = model_dict[model_type]
         hf_config._awq_config = config.awq_config
         self.model = model_cls(hf_config)
